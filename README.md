@@ -1,3 +1,8 @@
+# 说明
+
+这个README文档是NCCL的，这里我没有做什么修改，只是增加了一部分自己的阅读笔记。基于v2.25.1-1: NCCL 2.25.1-1
+
+
 # NCCL
 
 Optimized primitives for inter-GPU communication.
