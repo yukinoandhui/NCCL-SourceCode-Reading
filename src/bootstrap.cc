@@ -475,31 +475,34 @@ struct bootstrapRing_t {
     } socket;
   };
 };
+//负责管理监听连接
 struct bootstrapListen_t {
+  //点对点通信套接字
   struct ncclSocket peerSocket; // socket for peers to contact me in P2P
-  union {
+  union {//使用联合体设计支持两种不同的通信后端：网络设备通信、套接字通信。适用于高性能网络（如InfiniBand）
+    //这里的“网络设备通信”专指​​绕过操作系统内核、直接利用网卡硬件能力​​的通信方式（如RDMA），而非普通路由器/交换机的通信。
     struct {
       int dev;
       void* comm;
-      char handle[NCCL_NET_HANDLE_MAXSIZE];
+      char handle[NCCL_NET_HANDLE_MAXSIZE];// 网络句柄，用于远程连接
     } net;
-    struct ncclSocket socket; // socket to be used for the ring
+    struct ncclSocket socket; // socket to be used for the ring。当不使用高性能网络时的备选方案
   };
 };
 //存储了通信初始化过程中的所有关键信息
 struct bootstrapState {
   struct bootstrapRing_t ring;//环形拓扑连接信息，包含发送和接收通道
   struct bootstrapListen_t listen;//用于接收其他进程连接的监听端点
-  ncclNet_t* net;
-  uint64_t* peerProxyAddressesUDS;
-  union ncclSocketAddress* peerProxyAddresses;
-  union ncclSocketAddress* peerP2pAddresses;
-  struct unexConn* unexpectedConnections;
-  int cudaDev;
+  ncclNet_t* net; //指向NCCL网络接口的指针，其实就是不同的后端实现。net.cc中有定义
+  uint64_t* peerProxyAddressesUDS;//Unix域套接字地址数组，用于代理通信。 UDS是Unix域套接字，这个是进程间通信用的，同一台机器的不同进程之间进行通信，这样比用TCP套接字高效多了（少了各种头部和检验等）
+  union ncclSocketAddress* peerProxyAddresses;//代理服务的网络地址数组，用于跨节点通信时建立代理连接
+  union ncclSocketAddress* peerP2pAddresses;//点对点通信的网络地址数组，直接点对点通信的地址信息
+  struct unexConn* unexpectedConnections;//管理意外到达的连接请求链表。当连接请求在预期之前到达时，会暂存在这个链表中
+  int cudaDev;//当前进程使用的CUDA设备ID
   int rank;
   int nranks;
   uint64_t magic;
-  volatile uint32_t* abortFlag;
+  volatile uint32_t* abortFlag;//原子标志位，用于安全终止通信
 };
 #define STATE_RING(s, f) (s->ring.f)
 #define STATE_LISTEN(s, f) (s->listen.f)

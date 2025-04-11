@@ -56,13 +56,18 @@ typedef struct {
   size_t maxCollBytes;             // Max transfer size for collective operations
 } ncclNetProperties_v9_t;
 typedef ncclNetProperties_v9_t ncclNetProperties_t;
-
+/*
+它提供了一组函数指针，用于实现不同网络后端的通信功能。这是NCCL插件化网络架构的基础。
+这个接口设计使NCCL能够支持多种网络后端:
+-transport/net_socket.cc
+-InfiniBand/RDMA在transport/net_ib.cc
+*/
 typedef struct {
   // Name of the network (mainly for logs)
   const char* name;
   // Initialize the network.
   ncclResult_t (*init)(ncclDebugLogger_t logFunction);
-  // Return the number of adapters.
+  // Return the number of adapters.获取可用网络适配器数量
   ncclResult_t (*devices)(int* ndev);
   // Get various device properties.
   ncclResult_t (*getProperties)(int dev, ncclNetProperties_v9_t* props);
@@ -84,6 +89,7 @@ typedef struct {
   ncclResult_t (*accept)(void* listenComm, void** recvComm, ncclNetDeviceHandle_v8_t** recvDevComm);
   // Register/Deregister memory. Comm can be either a sendComm or a recvComm.
   // Type is either NCCL_PTR_HOST or NCCL_PTR_CUDA.
+  // 注册内存区域，支持主机内存、CUDA内存和DMA-BUF
   ncclResult_t (*regMr)(void* comm, void* data, size_t size, int type, void** mhandle);
   /* DMA-BUF support */
   ncclResult_t (*regMrDmaBuf)(void* comm, void* data, size_t size, int type, uint64_t offset, int fd, void** mhandle);
@@ -106,6 +112,7 @@ typedef struct {
   ncclResult_t (*closeListen)(void* listenComm);
 
   // Copy the given mhandle to a dptr in a format usable by this plugin's device code
+  // 将内存句柄转换为设备可用格式
   ncclResult_t (*getDeviceMr)(void* comm, void* mhandle, void** dptr_mhandle);
 
   // Notify the plugin that a recv has completed by the device
@@ -174,7 +181,7 @@ typedef struct {
   // Create a virtual NIC given the specified properties, which can be accessed at device index d
   ncclResult_t (*makeVDevice)(int* d, ncclNetVDeviceProps_t* props);
 } ncclCollNet_v9_t;
-
+//ncclNet_t提供基础的网络通信功能,主要用于节点间的点对点通信，而ncclCollNet_t专门用于高效实现集体通信操作，如规约、广播等，一个操作涉及多个节点
 typedef ncclCollNet_v9_t ncclCollNet_t;
 
 #define NCCL_COLLNET_PLUGIN_SYMBOL ncclCollNetPlugin_v9

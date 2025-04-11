@@ -53,7 +53,7 @@ enum ncclSocketType {
 
 struct ncclSocket {
   int fd;// 文件描述符，用于标识socket连接
-  int acceptFd;// 用于accept操作的临时文件描述符
+  int acceptFd;// 用于accept操作的临时文件描述符，就是accept的参数，accept返回的则是fd
   int errorRetries;// 错误重试次数计数器
   union ncclSocketAddress addr;// 套接字地址信息（支持IPv4/IPv6）
   volatile uint32_t* abortFlag;// 中止标志指针，用于异步中断操作

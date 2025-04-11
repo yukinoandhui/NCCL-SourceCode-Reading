@@ -703,7 +703,7 @@ ncclResult_t ncclSocketConnect(struct ncclSocket* sock) {
       return ncclInternalError;
   }
 }
-
+//nccl封装的accept函数，实现了标准socket accept操作的封装，并添加了状态管理和错误处理
 ncclResult_t ncclSocketAccept(struct ncclSocket* sock, struct ncclSocket* listenSock) {
   ncclResult_t ret = ncclSuccess;
 

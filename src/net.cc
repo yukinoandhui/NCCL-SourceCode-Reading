@@ -616,6 +616,7 @@ static ncclResult_t ncclCollNet_v8_as_v9_init(ncclDebugLogger_t logfn) {
 }
 
 static pthread_mutex_t netLock = PTHREAD_MUTEX_INITIALIZER;
+//初始化网络后端。
 ncclNet_t* ncclNets[NCCL_NET_MAX_PLUGINS] = { nullptr, &ncclNetIb, &ncclNetSocket };
 ncclCollNet_t* ncclCollNets[NCCL_NET_MAX_PLUGINS] = { nullptr, nullptr, nullptr };
 enum ncclNetState {
