@@ -21,13 +21,14 @@
 NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 
 // Returns maximum kernel stack size of all CUDA kernels
+// 主要功能是为 NCCL 的 CUDA 内核配置共享内存和栈大小参数。栈其实就是local memory
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize) {
   ncclResult_t result = ncclSuccess;
   int print = 0;
 
   if (maxStackSize) *maxStackSize = 0;
-  int carveout = ncclParamL1SharedMemoryCarveout();
-  int ncclMaxSharedMem = ncclShmemDynamicSize(cudaArch);
+  int carveout = ncclParamL1SharedMemoryCarveout();//获取L1缓存/共享内存分区比例参数
+  int ncclMaxSharedMem = ncclShmemDynamicSize(cudaArch);//最大可用动态共享内存
 
   for (int k=0; k < ncclDevKernelCount; k++) {
     void* fn = ncclDevKernelList[k];

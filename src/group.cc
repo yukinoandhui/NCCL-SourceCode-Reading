@@ -11,7 +11,7 @@
 #include "channel.h"
 #include <assert.h>
 #include "bootstrap.h"
-
+//__thread是 GCC 的扩展语法，表示该变量是线程局部存储的，避免同步问题。
 __thread int ncclGroupDepth = 0; // depth of ncclGroupStart nesting
 __thread ncclResult_t ncclGroupError = ncclSuccess;
 __thread struct ncclComm* ncclGroupCommHead = nullptr;
@@ -35,7 +35,7 @@ ncclResult_t ncclAsyncLaunch(
   job->destroyFlag = comm->destroyFlag;
   if (ncclGroupDepth == 0) {
     ret = func(job);
-    if (ret != ncclSuccess && undo) undo(job);
+    if (ret != ncclSuccess && undo) undo(job);//撤销
     if (destructor) destructor(job);
   } else {
     job->func = func;
@@ -58,6 +58,7 @@ ncclResult_t ncclAsyncLaunch(
       ret = ncclInvalidArgument;
     }
     if (ret == ncclSuccess) {
+      //如果 ncclGroupDepth 大于 0，表示在组调用中，需要将任务加入异步队列
       ncclIntruQueueEnqueue(&ncclAsyncJobs, job);
     } else {
       // no need to undo, the job hasn't run

@@ -101,10 +101,24 @@ ncclResult_t ncclGetVersion(int* version) {
 }
 
 NCCL_API(ncclResult_t, ncclGetUniqueId, ncclUniqueId* out);
+//ncclGetUniqueId其实就是根据root的套接字地址和magic数hash得到的
 ncclResult_t ncclGetUniqueId(ncclUniqueId* out) {
+  /*
+    ncclInit主要负责初始化，会创建一个临时线程去初始化：
+    - 根据环境变量NCCL_CONF_FILE读取配置文件，然后设置新的环境变量。
+    - 初始化GPUDirect RDMA
+    - 找到本地的网络接口。简单来说就是遍历一下机器上的网卡，把可用的信息保存下来。（bootstrapNetInit）
+  */
   NCCLCHECK(ncclInit());
   NCCLCHECK(PtrCheck(out, "GetUniqueId", "out"));
   struct ncclBootstrapHandle handle;
+  /*
+  bootstrapGetUniqueId尝试从环境变量中获取到通信ID，没有找到函数则会调用
+  bootstrapCreateRoot 来创建一个新的根节点（其实就是本地的），用于后续的通信初始化。bootstrapCreateRoot会调用引导程序的核心函数，负责协调所有进程的初始化过程
+  具体来说就是root会监听端口，等待其他rank的连接，连接后交换信息，并根据这些信息去让不同的rank之间建立联系（TCP连接、ring模式）。root这时候的作用就是把某个rank
+  的信息发给这个rank的前驱和后继节点。比如当前处理到了rank3，那么就会把rank3的信息发给rank2，同时把rank4的信息发送给rank3（前提是这些信息都已经存在）
+  最终通过TCP建立了一个环
+  */
   NCCLCHECK(bootstrapGetUniqueId(&handle));
   // ncclUniqueId and bootstrapHandle don't have the same size and alignment
   // reset to 0 to avoid undefined data
@@ -1336,7 +1350,9 @@ exit:
 fail:
   goto exit;
 }
-
+/*
+初始化 NCCL 通信器
+*/
 static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
   ncclComm_t comm = job->comm;
@@ -1352,6 +1368,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   unsigned long long commIdHash;
 
   timers[TIMER_INIT_TOTAL] = clockNano();
+  //获取设备的一系列能力
   CUDACHECKGOTO(cudaSetDevice(cudaDev), res, fail);
   CUDACHECKGOTO(cudaDeviceGetAttribute(&maxSharedMem, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev), res, fail);
   CUDACHECKGOTO(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, cudaDev), res, fail);
@@ -1361,19 +1378,21 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   timers[TIMER_INIT_KERNELS] = clockNano();
   NCCLCHECK(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes));
   // Set the maximum kernel stack size of all kernels to avoid
-  // a CUDA memory reconfig on load (c.f. NVSHMEM issue)
+  // a CUDA memory reconfig on load (c.f. NVSHMEM issue)NVSHMEM依赖特定的内存布局,运行时的内存重新配置可能破坏这种布局
   if (maxLocalSizeBytes > 0 && ncclParamSetStackSize() == 1) {
     TRACE(NCCL_INIT, "Setting cudaLimitStackSize to %zu", maxLocalSizeBytes);
-    CUDACHECKIGNORE(cudaDeviceSetLimit(cudaLimitStackSize, maxLocalSizeBytes));
+    CUDACHECKIGNORE(cudaDeviceSetLimit(cudaLimitStackSize, maxLocalSizeBytes));//每个线程的栈大小
   }
   timers[TIMER_INIT_KERNELS] = clockNano() - timers[TIMER_INIT_KERNELS];
-
+  //当存在父通信器时( job->parent )，执行分裂逻辑
   if (job->parent) {
     NCCLCHECKGOTO(ncclCalloc(&parentRanks, job->parent->nRanks), res, fail);
+    //获取分裂信息(颜色和键值)
     NCCLCHECKGOTO(commGetSplitInfo(comm, job->parent, job->color, job->key, &job->nranks, &job->myrank, parentRanks), res, fail);
     // Negative color does not create a new comm object. We needed to take part in the allgather, but we're done now.
     if (job->color == NCCL_SPLIT_NOCOLOR) goto exit;
     timers[TIMER_INIT_ALLOC] = clockNano();
+    //分配通信器所需的各种内存资源
     NCCLCHECKGOTO(commAlloc(comm, job->parent, job->nranks, job->myrank), res, fail);
     timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC];
     // obtain a unique hash for the comm, re-using part of the parent's hash, commHash is a 64bit struct (=16 hex),
@@ -1381,10 +1400,13 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     ncclUniqueId tmpId;
     memset(&tmpId,0,sizeof(ncclUniqueId));// must set 0 here to avoid undefined bits
     snprintf((char*)&tmpId, NCCL_UNIQUE_ID_BYTES, "%016lx-%d-%d", job->parent->commHash, job->splitCount, job->color);
+    //为分裂创建的通信器生成唯一哈希值的关键部分。防止通信器ID冲突导致消息误传。哈希值用于关联通信器与底层传输资源
+    //这种设计既保证了通信器的唯一性，又保持了拓扑关系的可追溯性，是NCCL多进程通信安全可靠的基础。
     comm->commHash = getHash(tmpId.internal, NCCL_UNIQUE_ID_BYTES);
     INFO(NCCL_INIT, "%s comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx parent %p splitCount %d color %d key %d- Init START", job->funcName,
          comm, comm->rank, comm->nRanks, comm->cudaDev, comm->nvmlDev, comm->busId, job->parent, job->splitCount, job->color, job->key);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano();
+    //建立新通信组的bootstrap连接
     NCCLCHECKGOTO(bootstrapSplit(comm->commHash, comm, job->parent, job->color, job->key, parentRanks), res, fail);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano() - timers[TIMER_INIT_BOOTSTRAP];
     // debug info, no commId was used
@@ -1399,6 +1421,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     INFO(NCCL_INIT, "%s comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx commId 0x%llx - Init START", job->funcName,
          comm, comm->rank, comm->nRanks, comm->cudaDev, comm->nvmlDev, comm->busId, commIdHash);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano();
+    //建立进程间通信的基础设施
     NCCLCHECKGOTO(bootstrapInit(job->nId, (struct ncclBootstrapHandle*)job->commId, comm), res, fail);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano() - timers[TIMER_INIT_BOOTSTRAP];
   }
@@ -1715,6 +1738,7 @@ fail:
 }
 
 NCCL_API(ncclResult_t, ncclCommInitRank, ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank);
+// 用于初始化一个通信器（communicator）这个函数是阻塞的，会等待所有进程都完成初始化
 ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank) {
   NVTX3_RANGE(NcclNvtxParamsCommInitRank)
   // Load the CUDA driver and dlsym hooks (can fail on old drivers) dlsym是动态链接库相关的。可以从共享库（动态库）中获取符号（全局变量与函数符号）地址，通常用于获取函数符号地址
@@ -1723,9 +1747,9 @@ ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId comm
   int cudaDev;
   ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
   CUDACHECK(cudaGetDevice(&cudaDev));
-
+  //执行实际的初始化工作
   NCCLCHECK(ncclCommInitRankDev(newcomm, nranks, 1, &commId, myrank, cudaDev, &config, __func__));//__func__是函数名
-
+  //添加性能分析相关的 payload
   NVTX3_RANGE_ADD_PAYLOAD(CommInitRank, NcclNvtxParamsCommInitRankSchema,
     NVTX3_PAYLOAD((*newcomm)->commHash, nranks, myrank, cudaDev));
 

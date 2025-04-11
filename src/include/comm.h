@@ -34,7 +34,7 @@ struct cudaLaunchParams {
 #define CUDA_IPC_MIN 2097152UL
 
 // Channels / LL tuning
-#define NCCL_LL_THREAD_THRESHOLD 8
+#define NCCL_LL_THREAD_THRESHOLD 8 //小消息使用更少的线程（8个线程）
 #define NCCL_LL128_THREAD_THRESHOLD 8
 #define NCCL_SIMPLE_THREAD_THRESHOLD 64
 
@@ -440,7 +440,7 @@ struct ncclKernelPlanner {
 };
 
 #define NCCL_MAGIC 0x0280028002800280 // Nickel atomic number is 28.
-
+// 每个GPU知道我要和哪些GPU通信，并且能够进行集合通信。
 struct ncclComm {
   uint64_t startMagic;
   struct ncclMemoryStack memPermanent, memScoped; // 管理永久和作用域内存

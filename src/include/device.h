@@ -495,6 +495,17 @@ __host__ __device__ constexpr int ncclShmemDynamicSize(int cudaArch = NCCL_CUDA_
   return cudaArch < 700 ? 0 : ncclShmemScratchWarpSize(cudaArch)*(NCCL_MAX_NTHREADS/WARP_SIZE);
 }
 
+/*
+各种kernel的信息。初始化时生成所有可能的内核组合
+内核在NCCL初始化阶段建立，通过 src/device/generate.py 脚本动态生成不同算法组合的内核
+在CUDA上下文创建时编译内核（cudaLaunchKernel）
+为不同算法/数据类型组合生成专用内核
+// 例如为AllReduce+Sum+Float32生成专用内核
+row = ((ncclDevSum*ncclNumTypes + ncclFloat)*nAlgos + algo)*NCCL_NUM_PROTOCOLS + proto;
+kernel = ncclDevKernelForFunc[row];
+
+好处是：减少运行时分支 ：通过预编译消除条件判断。因为用数组的话，就是直接跳转了，没有分支预测
+*/
 // Host-side table of kernel function pointers.
 extern int const ncclDevKernelCount;
 extern void* const ncclDevKernelList[/*ncclDevKernelCount*/];

@@ -69,7 +69,7 @@ void initEnv() {
   static pthread_once_t once = PTHREAD_ONCE_INIT;
   pthread_once(&once, initEnvFunc);
 }
-
+//从环境变量中读取配置参数并缓存，确保所有线程看到的参数值一致且只需解析一次环境变量
 void ncclLoadParam(char const* env, int64_t deftVal, int64_t uninitialized, int64_t* cache) {
   static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock(&mutex);

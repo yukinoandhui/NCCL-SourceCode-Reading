@@ -92,7 +92,7 @@ static int bootstrapNetInitDone = 0;
 pthread_mutex_t bootstrapNetLock = PTHREAD_MUTEX_INITIALIZER;
 
 NCCL_PARAM(BootstrapNetEnable,"OOB_NET_ENABLE", 0);
-
+//找到本地的网络接口。简单来说就是遍历一下机器上的网卡，把可用的信息保存下来。
 ncclResult_t bootstrapNetInit() {
   if (bootstrapNetInitDone == 0) {
     pthread_mutex_lock(&bootstrapNetLock);
@@ -408,7 +408,7 @@ out:
   TRACE(NCCL_BOOTSTRAP, "DONE");
   return NULL;
 }
-//只有rank0调用了。（getUniqueId会调用这个）
+//只有rank0调用了。（getUniqueId会调用这个），简单来说就是负责进程初始化，让各个rank之间建立连接
 ncclResult_t bootstrapCreateRoot(struct ncclBootstrapHandle* handle, bool idFromEnv) {
   ncclResult_t ret = ncclSuccess;
   struct ncclSocket* listenSock = NULL;
@@ -486,10 +486,10 @@ struct bootstrapListen_t {
     struct ncclSocket socket; // socket to be used for the ring
   };
 };
-
+//存储了通信初始化过程中的所有关键信息
 struct bootstrapState {
-  struct bootstrapRing_t ring;
-  struct bootstrapListen_t listen;
+  struct bootstrapRing_t ring;//环形拓扑连接信息，包含发送和接收通道
+  struct bootstrapListen_t listen;//用于接收其他进程连接的监听端点
   ncclNet_t* net;
   uint64_t* peerProxyAddressesUDS;
   union ncclSocketAddress* peerProxyAddresses;
@@ -655,7 +655,13 @@ NCCL_PARAM(StaggerRate, "UID_STAGGER_RATE", 7000);
 NCCL_PARAM(StaggerThreshold, "UID_STAGGER_THRESHOLD", 256);
 
 NCCL_PARAM(RasEnable, "RAS_ENABLE", 1);
-
+//负责建立进程间的通信基础设施,处理多节点、多GPU场景下的通信初始化
+/*
+- 创建监听socket用于接收连接
+- 与root节点交换连接信息
+- 建立环形拓扑连接
+- 初始化代理服务
+*/
 ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   ncclResult_t result = ncclSuccess;
   int rank = comm->rank;
