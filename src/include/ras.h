@@ -10,11 +10,13 @@
 #include "socket.h"
 
 // Structure used to communicate data about NCCL ranks from NCCL threads to RAS.
+//用于监控和管理分布式训练中的GPU集群健康状态
+// reliability, availability, and serviceability.可靠性、可用性和可服务性
 struct rasRankInit {
   union ncclSocketAddress addr;
   pid_t pid;
   int cudaDev;
-  int nvmlDev;
+  int nvmlDev;//NVML设备ID，用于通过NVIDIA管理库监控GPU状态。NVIDIA Management Library (NVML)
 };
 
 ncclResult_t ncclRasCommInit(struct ncclComm* comm, struct rasRankInit* myRank);

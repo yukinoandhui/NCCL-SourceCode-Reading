@@ -1284,8 +1284,8 @@ NCCL_PARAM(MinCTAs, "MIN_CTAS", NCCL_CONFIG_UNDEF_INT);
 #define NCCL_COMMINIT_FUNCNAME_LEN 128
 struct ncclCommInitRankAsyncJob {
   struct ncclAsyncJob base;
-  struct ncclComm* comm;
-  struct ncclComm** newcomm;
+  struct ncclComm* comm;//指向要初始化的通信器对象的指针
+  struct ncclComm** newcomm;//二级指针，用于存储初始化完成后的通信器地址，使调用者能够获取结果
   int cudaDev;
   // For ncclCommInitRank
   int nranks, myrank, nId;
@@ -1376,7 +1376,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   cudaArch = 100*archMajor + 10*archMinor;
 
   timers[TIMER_INIT_KERNELS] = clockNano();
-  NCCLCHECK(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes));
+  NCCLCHECK(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes));//ncclInitKernelsForDevice
   // Set the maximum kernel stack size of all kernels to avoid
   // a CUDA memory reconfig on load (c.f. NVSHMEM issue)NVSHMEM依赖特定的内存布局,运行时的内存重新配置可能破坏这种布局
   if (maxLocalSizeBytes > 0 && ncclParamSetStackSize() == 1) {

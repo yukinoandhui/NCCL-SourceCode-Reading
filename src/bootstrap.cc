@@ -91,6 +91,13 @@ static union ncclSocketAddress bootstrapNetIfAddr;
 static int bootstrapNetInitDone = 0;
 pthread_mutex_t bootstrapNetLock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+控制是否启用高性能网络接口进行引导过程通信。Out-of-Band（OOB，带外）通信​​​独立于主通信路径​​的辅助通道，
+用于交换元数据（如GPU拓扑、rank信息等），通常发生在通信器（communicator）初始化阶段（如allgather操作）。
+​​传统实现​​默认使用主机（CPU）的TCP/IP或Unix域套接字进行OOB通信(例如urgent mode信息)，可能成为性能瓶颈。
+在初始化阶段（如allgather），使用NCCL Net的高性能路径（如InfiniBand）代替默认的TCP/IP，加速元数据交换。
+原本依赖CPU的OOB通信（如套接字）改为通过GPU直接访问网络设备（如RDMA网卡），减少CPU参与。
+*/
 NCCL_PARAM(BootstrapNetEnable,"OOB_NET_ENABLE", 0);
 //找到本地的网络接口。简单来说就是遍历一下机器上的网卡，把可用的信息保存下来。
 ncclResult_t bootstrapNetInit() {
@@ -241,7 +248,7 @@ struct extInfo {
   int nranks;                                // total number of ranks// 总进程数
   int iroot;                                 // current root index// 当前root索引
   int nroots;                                // total number of roots// root总数
-  union ncclSocketAddress listenRootAddress; // address of my listenSocket for the root// root监听socket的地址
+  union ncclSocketAddress listenRootAddress; // address of my listenSocket for the root// 用于存储当前进程为 root 节点创建的监听套接字地址。
   union ringConnectInfo connectInfo;// 环形拓扑连接信息
 };
 #define NET_HANDLE(h, rank)    ((h) + (rank * NCCL_NET_HANDLE_MAXSIZE))
@@ -462,14 +469,14 @@ struct unexConn {
   struct ncclSocket sock;
   struct unexConn* next;
 };
-
+//NCCL中用于建立环形通信拓扑的关键数据结构。支持不同的后端
 struct bootstrapRing_t {
   union {
-    struct {
+    struct {//高性能网络通信 (net)
       void *sendComm, *recvComm;
       ncclNetDeviceHandle_t *sendDevHandle, *recvDevHandle;
     } net;
-    struct {
+    struct {//套接字通信 (socket)
       struct ncclSocket recv;
       struct ncclSocket send;
     } socket;
@@ -482,8 +489,8 @@ struct bootstrapListen_t {
   union {//使用联合体设计支持两种不同的通信后端：网络设备通信、套接字通信。适用于高性能网络（如InfiniBand）
     //这里的“网络设备通信”专指​​绕过操作系统内核、直接利用网卡硬件能力​​的通信方式（如RDMA），而非普通路由器/交换机的通信。
     struct {
-      int dev;
-      void* comm;
+      int dev;//网络设备标识符 ：它是一个整数值，用于标识系统中的特定网络设备（如InfiniBand HCA或RoCE网卡）
+      void* comm; //应该是ncclNetSocketListenComm
       char handle[NCCL_NET_HANDLE_MAXSIZE];// 网络句柄，用于远程连接
     } net;
     struct ncclSocket socket; // socket to be used for the ring。当不使用高性能网络时的备选方案
@@ -522,28 +529,38 @@ static ncclResult_t getUDS(uint64_t* peerUDS) {
   return ncclSuccess;
 }
 #define MAX_OOB_DEVS 16
+//选择合适的网络设备（网络接口或者叫网卡）负责后续的通信，通常是指InfiniBand HCA、RoCE网卡或其他支持RDMA的网络设备。
 static ncclResult_t netGetDevice(int rank, struct ncclComm* comm, int* dev) {
-  static int devOOB = -1;
+  static int devOOB = -1;//缓存已选择的设备ID
   if (devOOB < 0) {
     pthread_mutex_lock(&bootstrapNetLock);
     if (devOOB < 0) {
+      //例如NCCL_NET="IB" NCCL_OOB_NET_ENABLE=1 NCCL_OOB_NET_IFNAME="=mlx5_1"表示使用Infiniband NET，网络接口使用mlx5_1
       char* userIfEnv = getenv("NCCL_OOB_NET_IFNAME");
       if (userIfEnv && strlen(userIfEnv) > 0) {
+        /*
+          - 排除模式（ ^ 前缀）：排除指定设备
+          - 精确匹配（ = 前缀）：精确匹配设备名称和端口
+          - 普通匹配：部分匹配设备名称
+          前缀匹配 ：例如 mlx5 可以匹配所有以"mlx5"开头的网卡
+          精确匹配 ：例如 =mlx5_0 要求完全匹配网卡名称
+        */
         INFO(NCCL_BOOTSTRAP | NCCL_ENV, "NCCL_OOB_NET_IFNAME set to %s", userIfEnv);
         bool searchNot = userIfEnv && userIfEnv[0] == '^';
-        if (searchNot) userIfEnv++;
+        if (searchNot) userIfEnv++;//排除指定设备
         bool searchExact = userIfEnv && userIfEnv[0] == '=';
         if (searchExact) userIfEnv++;
-        struct netIf userIfs[MAX_OOB_DEVS];
+        struct netIf userIfs[MAX_OOB_DEVS];//存放解析到的设备，例如mlx5_1，ens1f0
         int nUserIfs = parseStringList(userIfEnv, userIfs, MAX_OOB_DEVS);
         // loop over the device and return the first one matching
         int nDev = 0;
-        NCCLCHECK(comm->ncclNet->devices(&nDev));
+        NCCLCHECK(comm->ncclNet->devices(&nDev));//获取适配器的数量
         int devId = 0;
         while (devId < nDev) {
           ncclNetProperties_t props;
           comm->ncclNet->getProperties(devId, &props);
           // check against user specified HCAs/ports
+          //检查当前设备是否匹配用户在 NCCL_OOB_NET_IFNAME 环境变量中指定的条件。因为像userIfs这些的信息都是环境变量指定的，不一定完全匹配实际的硬件信息（props）
           if (matchIfList(props.name, props.port, userIfs, nUserIfs, searchExact) ^ searchNot) {
             // All plain physical devices have been initialized at this point
             devOOB = devId;
@@ -675,7 +692,7 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   struct ncclSocket sock, listenSockRoot;
   struct extInfo info = {0};
   union ringConnectInfo nextPeer;
-  bool performRasAddRanks = true;
+  bool performRasAddRanks = true;//控制是否执行RAS(Rank and Shared memory)相关的初始化操作
   struct rasRankInit* rasRanks = nullptr;
 
   uint64_t timers[BOOTSTRAP_INIT_TIME_N] = {0};
@@ -694,19 +711,24 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_TOTAL]);
   // fill up the info
   info.nranks = nranks;
-  info.nroots = nHandles;
+  info.nroots = nHandles;//参数代表的是 ncclUniqueId 的数量
   // get the ring connection info
   memset(&nextPeer, 0, sizeof(union ringConnectInfo));
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_CREATE]);
-  if (ncclParamBootstrapNetEnable()) {
+  if (ncclParamBootstrapNetEnable()) {//当启用高性能网络通信时
     // Create net interface for other ranks to contact me (all gather)
+    //获取网络设备ID,确定使用哪个网络设备（网卡），然后存储到state里面的listen.net.dev中
     NCCLCHECK(netGetDevice(rank, comm, &STATE_LISTEN(state, net.dev)));
+    //调用了网络后端的监听函数，用于创建一个网络监听端点，handle用于存储生成的网络句柄（ncclNetSocketHandle，用于在网络连接建立过程中传递必要的连接信息），net.comm用于存储创建的通信对象，注意这里的通信对象comm和ncclComm不是同一个概念
     NCCLCHECK(state->net->listen(STATE_LISTEN(state, net.dev), STATE_LISTEN(state, net.handle), &STATE_LISTEN(state, net.comm)));
     memcpy(info.connectInfo.handle, STATE_LISTEN(state, net.handle), NCCL_NET_HANDLE_MAXSIZE);
   } else {
     // create socket for ring neightbor to contact mee
     NCCLCHECK(createListenSocket(comm, comm->magic, &STATE_LISTEN(state, socket), &info.connectInfo.addr, ncclSocketTypeBootstrap));
   }
+  /*
+    我们知道，前面getuniqueId的时候root已经listen了，这里也listen，因为每个节点都要接收其他节点的链接。
+  */
   // Create socket for root to contact me using the root's magic
   int curr_root = rootIdFromRank(rank, nranks, nHandles);
   NCCLCHECK(createListenSocket(comm, BOOTSTRAP_HANDLE(handles, curr_root)->magic, &listenSockRoot, &info.listenRootAddress, ncclSocketTypeBootstrap));
@@ -714,10 +736,13 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
 
   // stagger connection times to avoid an overload of the root
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_DELAY]);
-  int nRankRoot = nRankFromRoot(curr_root, nranks, nHandles);
-  if (nRankRoot > ncclParamStaggerThreshold()) {
+  int nRankRoot = nRankFromRoot(curr_root, nranks, nHandles);//获取当前root节点需要处理的rank数量。
+  /*
+    连接延迟策略 ，用于避免大量进程同时连接root节点导致的过载问题
+  */
+  if (nRankRoot > ncclParamStaggerThreshold()) {//检查当前root节点需要处理的rank数量 nRankRoot 是否超过阈值。如果超过阈值，则需要对连接进行延迟处理
     // for socket the message rate in microsec
-    double msg_rate = ncclParamStaggerRate() / 1.0e6;
+    double msg_rate = ncclParamStaggerRate() / 1.0e6;//计算每个进程的消息发送速率
     long musec = localIdFromRoot(rank, curr_root, nranks, nHandles) / msg_rate;
     struct timespec tv;
     long c_1e6 = 1e6;
@@ -728,12 +753,15 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   }
   BOOTSTRAP_PROF_CLOSE(timers[BOOTSTRAP_INIT_TIME_DELAY]);
 
+  /*
+  主要功能是将当前进程的连接信息发送给root节点，并在多root场景下处理跨root的通信
+  */
   // send info on my listening socket to root
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_SEND]);
   // send contact info to my own root
   info.rank = rank;
   info.iroot = curr_root;
-  NCCLCHECK(sendToRoot(BOOTSTRAP_HANDLE(handles, curr_root), comm, &info));
+  NCCLCHECK(sendToRoot(BOOTSTRAP_HANDLE(handles, curr_root), comm, &info));//将连接信息发送给当前root节点
   // if needed, send the connection info to the previous root
   if (nHandles > 1 && isFirstFromRoot(rank, curr_root, nranks, nHandles)) {
     int prev_rank = BOOTSTRAP_PID(rank - 1, nranks);

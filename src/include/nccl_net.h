@@ -27,31 +27,58 @@
 // Max number of ncclNet objects which can live in the same process
 #define NCCL_NET_MAX_PLUGINS 3
 
+//定义了每个网络接口卡(NIC)上最多可以支持的设备数量为4个
+//ConnectX系列最多4个连接端口
 #define NCCL_NET_MAX_DEVS_PER_NIC_V9 4
 #define NCCL_NET_MAX_DEVS_PER_NIC NCCL_NET_MAX_DEVS_PER_NIC_V9
 
+//每个设备代表一个可以独立进行通信的通道,这些通道可以并行工作，提高总体带宽
+//例如，一个双端口的InfiniBand适配器可能会报告 ndevs=2 ，表示有两个可用的通信端口，NCCL可以同时利用这两个端口进行通信，从而获得更高的带宽。
 typedef struct {
-  int ndevs;
-  int devs[NCCL_NET_MAX_DEVS_PER_NIC_V9];
+  int ndevs;//实际设备数量，网络接口卡(NIC)上的虚拟或物理设备数量
+  int devs[NCCL_NET_MAX_DEVS_PER_NIC_V9];//设备ID数组，最多存储4个设备的ID
 } ncclNetVDeviceProps_v9_t;
 typedef ncclNetVDeviceProps_v9_t ncclNetVDeviceProps_t;
 
+
+//网络设备属性
 typedef struct {
   char* name;                      // Used mostly for logging.
-  char* pciPath;                   // Path to the PCI device in /sys.
+  char* pciPath;                   // Path to the PCI device in /sys.PCI设备在/sys文件系统中的路径,通常是/sys/bus/pci/devices/
   uint64_t guid;                   // Unique identifier for the NIC chip. Important for
-                                   // cards with multiple PCI functions (Physical or virtual).
-  int ptrSupport;                  // [NCCL_PTR_HOST|NCCL_PTR_CUDA|NCCL_PTR_DMABUF]
-  int regIsGlobal;                 // regMr is not tied to a particular comm
-  int forceFlush;                  // Force a flush on receives
-  int speed;                       // Port speed in Mbps.
-  int port;                        // Port number.
-  float latency;                   // Network latency
-  int maxComms;                    // Maximum number of comms we can create
-  int maxRecvs;                    // Maximum number of grouped receives.
-  ncclNetDeviceType netDeviceType; // Network offload type
+                                   // cards with multiple PCI functions (Physical or virtual). 网卡芯片的唯一标识符，对于具有多个PCI功能的卡尤为重要
+                                   //一张双端口的网卡可能会在PCI总线上呈现为两个独立的PCI设备。这时候就需要guid来表明这些设备实际上属于同一个物理芯片。
+  int ptrSupport;                  // [NCCL_PTR_HOST|NCCL_PTR_CUDA|NCCL_PTR_DMABUF]：支持的内存类型标志位组合（主机内存/CUDA内存/DMA-BUF）
+  /*
+    表示内存注册的作用域，这是与RDMA（远程直接内存访问）相关的一个重要概念。
+    在RDMA网络（如InfiniBand、RoCE）中，内存必须先"注册"才能用于网络传输。这个注册过程包括：
+      1. 将内存页锁定（pin）在物理内存中，防止被操作系统换出
+      2. 将内存地址和权限信息注册到网卡，使网卡可以直接访问该内存区域
+      3. 获取一个内存句柄（mhandle），用于后续的通信操作
+    - 当regIsGlobal=0时 ：内存注册与特定的通信对象（comm）绑定
+        - 每个通信连接都需要单独注册相同的内存区域
+        - 当通信对象关闭时，相应的内存注册也会被释放
+        - 适用于连接数量少或内存区域频繁变化的场景
+    - 当regIsGlobal=1时 ：内存注册是全局有效的
+        - 一次注册可以被多个通信对象共用
+        - 即使某个通信对象关闭，内存注册仍然有效
+        - 需要显式调用deregMr来释放注册
+        - 适用于连接数量多且使用相同内存区域的场景
+    效果：
+        - 性能提升 ：避免重复注册相同内存区域，减少注册开销
+        - 资源节约 ：减少网卡上注册表项的使用
+  */
+  int regIsGlobal;                 // regMr is not tied to a particular comm：内存注册是否全局有效（不绑定到特定通信对象）
+
+  int forceFlush;                  // Force a flush on receives 是否在接收时强制刷新
+  int speed;                       // Port speed in Mbps. 端口速度
+  int port;                        // Port number. 端口号
+  float latency;                   // Network latency 网络延迟
+  int maxComms;                    // Maximum number of comms we can create 可创建的最大通信对象数量
+  int maxRecvs;                    // Maximum number of grouped receives. 分组接收的最大数量
+  ncclNetDeviceType netDeviceType; // Network offload type 网络卸载类型 是指将原本由 ​​CPU 软件协议栈​​ 处理的网络任务 ​​卸载到硬件​​。
   int netDeviceVersion;            // Version number for network offload
-  ncclNetVDeviceProps_v9_t vProps;
+  ncclNetVDeviceProps_v9_t vProps; //包含虚拟设备信息的结构体，支持多端口/多通道通信
   size_t maxP2pBytes;              // Max transfer size for point-to-point operations
   size_t maxCollBytes;             // Max transfer size for collective operations
 } ncclNetProperties_v9_t;

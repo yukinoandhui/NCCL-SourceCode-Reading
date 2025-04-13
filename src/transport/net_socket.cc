@@ -139,13 +139,13 @@ struct ncclNetSocketCommStage {
   struct ncclSocket* sock;
   struct ncclNetSocketComm* comm;
 };
-
+//用于在网络连接建立过程中传递必要的连接信息
 struct ncclNetSocketHandle {
-  union ncclSocketAddress connectAddr;
+  union ncclSocketAddress connectAddr;// 连接地址，包含IP和端口信息,存储目标节点的网络地址信息。
   uint64_t magic; // random number to help debugging
-  int nSocks;
-  int nThreads;
-  struct ncclNetSocketCommStage stage;
+  int nSocks;// 每个通信通道使用的套接字数量，多个套接字可以并行传输数据，提高带宽利用率
+  int nThreads; // 处理通信的线程数量
+  struct ncclNetSocketCommStage stage;  // 连接状态信息
 };
 
 struct ncclNetSocketTask {

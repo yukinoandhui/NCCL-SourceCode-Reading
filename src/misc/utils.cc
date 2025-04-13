@@ -163,7 +163,8 @@ int parseStringList(const char* string, struct netIf* ifList, int maxList) {
   } while (ifNum < maxList && c);
   return ifNum;
 }
-
+//前缀匹配 ：例如 mlx5 可以匹配所有以"mlx5"开头的网卡
+//精确匹配 ：例如 =mlx5_0 要求完全匹配网卡名称
 static bool matchIf(const char* string, const char* ref, bool matchExact) {
   // Make sure to include '\0' in the exact case
   int matchLen = matchExact ? strlen(string) + 1 : strlen(ref);

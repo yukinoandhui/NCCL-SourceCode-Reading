@@ -9,7 +9,7 @@
 
 #include "nccl.h"
 #include "comm.h"
-
+//ncclUniqueId 作为跨进程通信的载体，实际存储的是ncclBootstrapHandle 的内容,所以经常把ncclUniqueId强转为ncclBootstrapHandle。
 struct ncclBootstrapHandle {
   uint64_t magic;
   union ncclSocketAddress addr;
