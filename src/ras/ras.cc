@@ -59,9 +59,9 @@ char rasLine[SOCKET_NAME_MAXLEN+1];
 
 // An array holding the addresses of all NCCL communicators.  Modified by the NCCL threads (hence the mutex), read by
 // the RAS thread.
-std::mutex ncclCommsMutex;
-struct ncclComm** ncclComms = nullptr;
-int nNcclComms = 0;
+std::mutex ncclCommsMutex;//用于保护对通信器数组的并发访问，因为多个NCCL线程可能同时修改这个数组
+struct ncclComm** ncclComms = nullptr;//一个指向通信器指针的数组
+int nNcclComms = 0;//记录了数组的当前大小
 bool ncclCommsSorted = false; // Whether the array is currently sorted. We sort by the comms' commHash and rank.
 
 static ncclResult_t rasLocalNotify(const struct rasNotification* msg);
@@ -83,34 +83,36 @@ NCCL_PARAM(RasTimeoutFactor, "RAS_TIMEOUT_FACTOR", 1);
 // Invoked by regular NCCL threads on every comm initialization.  This is the first function to call.
 // The myRank structure should be passed with the addr element initialized to the IP address of the bootstrap
 // network interface to use.  On a successful return, the address will be updated with the port number of the
-// RAS network listening socket.
+// RAS network listening socket.  每个通信器(communicator)初始化时都会调用它。这个函数负责设置RAS线程和相关资源。
+//创建了RAS线程、监听套接字（方便其他的进程连接）。一个RAS线程可能管理多个通信器。
 ncclResult_t ncclRasCommInit(struct ncclComm* comm, struct rasRankInit* myRank) {
   ncclResult_t ret = ncclSuccess;
   if (!rasInitialized) {
+    // 如果RAS尚未初始化，创建监听套接字、管道和RAS线程, 确保每个进程只有一个RAS线程和端口
     std::lock_guard<std::mutex> lock(rasInitMutex);
     if (!rasInitialized) {
       union ncclSocketAddress addr;
 
       memcpy(&addr, &myRank->addr, sizeof(addr));
-      (addr.sa.sa_family == AF_INET ? addr.sin.sin_port : addr.sin6.sin6_port) = htons(0);
+      (addr.sa.sa_family == AF_INET ? addr.sin.sin_port : addr.sin6.sin6_port) = htons(0);// 设置端口为0，让系统自动分配端口
       NCCLCHECKGOTO(ncclSocketInit(&rasNetListeningSocket, &addr, NCCL_SOCKET_MAGIC, ncclSocketTypeRasNetwork,
                                    /*abortFlag*/nullptr, /*asyncFlag*/1), ret, fail);
-      NCCLCHECKGOTO(ncclSocketListen(&rasNetListeningSocket), ret, fail);
+      NCCLCHECKGOTO(ncclSocketListen(&rasNetListeningSocket), ret, fail);// 开始监听
       INFO(NCCL_RAS, "RAS network listening socket at %s",
            ncclSocketToString(&rasNetListeningSocket.addr, rasLine));
 
-      (void)rasClientInitSocket();
+      (void)rasClientInitSocket();// 初始化客户端套接字，同时还bind和listen了
 
-      SYSCHECKGOTO(pipe(rasNotificationPipe), "pipe", ret, fail);
-
+      SYSCHECKGOTO(pipe(rasNotificationPipe), "pipe", ret, fail);// 创建通知管道，用于NCCL线程与RAS线程通信。
+// 创建RAS线程
       PTHREADCHECKGOTO(pthread_create(&rasThread, nullptr, &rasThreadMain, nullptr), "pthread_create", ret, fail);
       ncclSetThreadName(rasThread, "NCCL RAS");
-      (void)pthread_detach(rasThread);
+      (void)pthread_detach(rasThread);//主线程调用 pthread_join 会阻塞，直到目标线程结束。这在某些场景（如异步任务）中不必要，甚至可能成为性能瓶颈。所以NCCL这里基本上都detach
 
-      rasInitialized = true;
+      rasInitialized = true;// 标记RAS已初始化
     }
   }
-  ncclAtomicRefCountIncrement(&rasInitRefCount);
+  ncclAtomicRefCountIncrement(&rasInitRefCount);// 增加引用计数。一个进程可以创建多个通信器。多个通信器共享同一个RAS线程和端口，引用计数确保只有一个RAS实例
 
   {
     std::lock_guard<std::mutex> lock(ncclCommsMutex);
@@ -121,20 +123,20 @@ ncclResult_t ncclRasCommInit(struct ncclComm* comm, struct rasRankInit* myRank) 
         break;
     }
     if (i == nNcclComms) {
-      NCCLCHECK(ncclRealloc(&ncclComms, nNcclComms, nNcclComms+RAS_INCREMENT*8));
+      NCCLCHECK(ncclRealloc(&ncclComms, nNcclComms, nNcclComms+RAS_INCREMENT*8)); // 如果数组已满，扩展数组
       nNcclComms += RAS_INCREMENT*8;
     }
     ncclComms[i] = comm;
     ncclCommsSorted = false;
   }
 
-  if (myRank != nullptr)
-    memcpy(&myRank->addr, &rasNetListeningSocket.addr, sizeof(myRank->addr));
+  if (myRank != nullptr)// 更新调用者的地址信息。因为最开始myRank->addr的端口号我们写的是0，所以后面需要更新为自动分配的端口号。其他节点上的进程需要使用这个地址和端口
+    memcpy(&myRank->addr, &rasNetListeningSocket.addr, sizeof(myRank->addr)); //RAS网络监听套接字的地址信息（包括系统自动分配的端口号）回传给调用者。
 
 exit:
   return ret;
 fail:
-  if (rasNotificationPipe[1] != 0)
+  if (rasNotificationPipe[1] != 0)//- 关闭标准输入（0）会导致最严重的问题，因为许多程序依赖标准输入来接收用户输入;关闭标准输出（1）或标准错误（2）通常不会导致程序崩溃，最多只是丢失输出信息
     (void)close(rasNotificationPipe[1]);
   if (rasNotificationPipe[0] != 0)
     (void)close(rasNotificationPipe[0]);

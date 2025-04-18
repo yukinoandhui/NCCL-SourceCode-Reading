@@ -43,12 +43,12 @@ enum ncclSocketState {
 };
 
 enum ncclSocketType {
-  ncclSocketTypeUnknown = 0,
-  ncclSocketTypeBootstrap = 1,
-  ncclSocketTypeProxy = 2,
-  ncclSocketTypeNetSocket = 3,
-  ncclSocketTypeNetIb = 4,
-  ncclSocketTypeRasNetwork = 5
+  ncclSocketTypeUnknown = 0,// 未知类型，默认值
+  ncclSocketTypeBootstrap = 1,// 用于引导过程的套接字
+  ncclSocketTypeProxy = 2,// 用于代理服务的套接字
+  ncclSocketTypeNetSocket = 3,// 网络套接字
+  ncclSocketTypeNetIb = 4,// InfiniBand网络套接字
+  ncclSocketTypeRasNetwork = 5// 可靠性、可用性和可服务性(RAS)网络套接字
 };
 
 struct ncclSocket {

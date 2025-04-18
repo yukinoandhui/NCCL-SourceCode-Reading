@@ -105,8 +105,9 @@ typedef struct {
   // Connect to a handle and return a sending comm object for that peer.
   // This call must not block for the connection to be established, and instead
   // should return successfully with sendComm == NULL with the expectation that
-  // it will be called again until sendComm != NULL.
+  // it will be called again until sendComm != NULL. 
   // If *sendDevComm points to a valid object, then NCCL is requesting device offload for this connection
+  //sendComm ：输出参数，用于存储建立的发送通信对象
   ncclResult_t (*connect)(int dev, void* handle, void** sendComm, ncclNetDeviceHandle_v8_t** sendDevComm);
   // Finalize connection establishment after remote peer has called connect.
   // This call must not block for the connection to be established, and instead

@@ -678,7 +678,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int rank = comm->rank;
   int nranks = comm->nRanks;
   int nNodes = 1;
-  cpu_set_t affinitySave;
+  cpu_set_t affinitySave; //CPU亲和性
   struct ncclTopoGraph* ringGraph = &comm->graphs[NCCL_ALGO_RING];
   struct ncclTopoGraph* treeGraph = &comm->graphs[NCCL_ALGO_TREE];
   struct ncclTopoGraph* collNetChainGraph = &comm->graphs[NCCL_ALGO_COLLNET_CHAIN];
@@ -1426,9 +1426,10 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     timers[TIMER_INIT_BOOTSTRAP] = clockNano() - timers[TIMER_INIT_BOOTSTRAP];
   }
   comm->cudaArch = cudaArch;
-
+  
+  // 初始化通信器的传输层、构建通信拓扑结构、设置通信通道，建立进程间的连接
   NCCLCHECKGOTO(initTransportsRank(comm, job->parent, timers), res, fail);
-  NCCLCHECKGOTO(ncclTunerPluginLoad(comm), res, fail);
+  NCCLCHECKGOTO(ncclTunerPluginLoad(comm), res, fail);//加载NCCL的调优插件。NCCL支持可插拔的调优机制，允许用户提供自定义的调优策略。
   if (comm->tuner) {
     NCCLCHECK(comm->tuner->init(comm->nRanks, comm->nNodes, ncclDebugLog, &comm->tunerContext));
   }

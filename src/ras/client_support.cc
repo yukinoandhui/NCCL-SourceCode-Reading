@@ -121,6 +121,7 @@ static bool rasCountIsOutlier(int count, bool verbose, int totalCount = -1);
 ///////////////////////////////////
 
 // Creates a listening socket for clients to connect to.
+//负责为RAS（可靠性、可用性和可服务性）子系统创建一个监听套接字，允许外部客户端连接到NCCL进程以获取诊断信息。
 ncclResult_t rasClientInitSocket() {
   ncclResult_t ret = ncclSuccess;
   const char* clientAddr = "localhost:" STR(NCCL_RAS_CLIENT_PORT);

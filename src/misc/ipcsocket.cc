@@ -29,6 +29,13 @@ ncclResult_t ncclIpcSocketInit(ncclIpcSocket *handle, int rank, uint64_t hash, v
 
   handle->fd = -1;
   handle->socketName[0] = '\0';
+  /*
+  对于 SOCK_DGRAM 类型的Unix域套接字，只需要：
+
+- 创建套接字
+- 绑定到特定地址
+- 就可以直接收发数据，不需要建立连接
+  */
   if ((fd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
     WARN("UDS: Socket creation error : %s (%d)", strerror(errno), errno);
     return ncclSystemError;
@@ -52,7 +59,7 @@ ncclResult_t ncclIpcSocketInit(ncclIpcSocket *handle, int rank, uint64_t hash, v
 
   strncpy(cliaddr.sun_path, temp, len);
 #ifdef USE_ABSTRACT_SOCKET
-  cliaddr.sun_path[0] = '\0'; // Linux abstract socket trick
+  cliaddr.sun_path[0] = '\0'; // Linux abstract socket trick 在unix域socket中不使用文件系统路径
 #endif
   if (bind(fd, (struct sockaddr *)&cliaddr, sizeof(cliaddr)) < 0) {
     WARN("UDS: Binding to socket %s failed : %s (%d)", temp, strerror(errno), errno);

@@ -126,18 +126,19 @@ NCCL_PARAM(SocketNsocksPerThread, "NSOCKS_PERTHREAD", -2);
 NCCL_PARAM(SocketNthreads, "SOCKET_NTHREADS", -2);
 
 enum ncclNetSocketCommState {
-  ncclNetSocketCommStateStart = 0,
-  ncclNetSocketCommStateConnect = 1,
-  ncclNetSocketCommStateAccept = 3,
-  ncclNetSocketCommStateSend = 4,
-  ncclNetSocketCommStateRecv = 5,
+  ncclNetSocketCommStateStart = 0,// 初始状态，表示通信尚未开始
+  ncclNetSocketCommStateConnect = 1,// 连接状态，表示正在尝试建立连接
+  ncclNetSocketCommStateAccept = 3,// 接受状态，表示正在等待接受连接
+  ncclNetSocketCommStateSend = 4,// 发送状态，表示正在发送数据
+  ncclNetSocketCommStateRecv = 5,// 接收状态，表示正在接收数据
 };
-
+//这个结构体存储了通信过程中的状态信息：状态保持 ：在非阻塞操作中，一个连接可能需要多次函数调用才能完成。
+// 这个结构体保存了中间状态，使得每次调用都能从上次中断的地方继续。(是实现高效非阻塞通信的关键)
 struct ncclNetSocketCommStage {
-  enum ncclNetSocketCommState state;
-  uint8_t iteration;
-  struct ncclSocket* sock;
-  struct ncclNetSocketComm* comm;
+  enum ncclNetSocketCommState state;// 当前通信状态
+  uint8_t iteration;// 当前处理的套接字索引
+  struct ncclSocket* sock;// 当前正在处理的套接字
+  struct ncclNetSocketComm* comm;// 关联的通信对象
 };
 //用于在网络连接建立过程中传递必要的连接信息
 struct ncclNetSocketHandle {
@@ -148,61 +149,76 @@ struct ncclNetSocketHandle {
   struct ncclNetSocketCommStage stage;  // 连接状态信息
 };
 
-struct ncclNetSocketTask {
-  int op;
-  void* data;
-  int size;
-  struct ncclSocket* sock;
-  int offset;
-  int used;
-  ncclResult_t result;
-};
+/*
+- 请求层 ： ncclNetSocketRequest 对应高级API（如 ncclNetSocketIsend ）调用，表示一个完整的通信操作
+- 任务分解 ：大请求被分解为多个 ncclNetSocketTask ，每个任务处理一部分数据
+- 任务分配 ：任务被分配到不同线程的 ncclNetSocketTaskQueue 中
+- 并行执行 ：多个辅助线程并行处理各自队列中的任务
+*/
 
-struct ncclNetSocketRequest {
-  int op;
+
+//基本的通信任务，由辅助线程执行
+struct ncclNetSocketTask {
+  int op;// 操作类型：NCCL_SOCKET_SEND 或 NCCL_SOCKET_RECV
   void* data;
   int size;
-  struct ncclSocket* ctrlSock;
-  int offset;
-  int used;
-  struct ncclNetSocketComm* comm;
-  struct ncclNetSocketTask* tasks[MAX_SOCKETS];
-  int nSubs;
+  struct ncclSocket* sock;// 用于此任务的套接字
+  int offset;// 当前已处理的数据偏移量，用于跟踪进度
+  int used; // 使用标志，1表示任务正在使用中，0表示可用
+  ncclResult_t result; // 任务执行结果
+};
+/*
+表示一个完整的通信请求，可能会被分解为多个任务。一个请求代表一个完整的发送或接收操作，它会：
+1. 首先通过控制套接字交换消息大小信息
+2. 然后将大消息分割成多个较小的块
+3. 为每个块创建一个任务，分配给不同的套接字和线程处理
+
+*/
+struct ncclNetSocketRequest {
+  int op;// 操作类型：NCCL_SOCKET_SEND 或 NCCL_SOCKET_RECV
+  void* data;
+  int size;
+  struct ncclSocket* ctrlSock; // 控制套接字，用于传输元数据（如消息大小）
+  int offset;// 当前处理进度
+  int used;// 使用状态：0=未使用，1=初始化中，2=数据传输中
+  struct ncclNetSocketComm* comm;// 所属的通信对象
+  struct ncclNetSocketTask* tasks[MAX_SOCKETS];// 子任务数组，请求被分解成的多个任务
+  int nSubs; // 子任务数量
 };
 
 struct ncclNetSocketTaskQueue {
-  int next;
-  int len;
-  struct ncclNetSocketTask* tasks;
+  int next;// 下一个可用任务槽的索引
+  int len;// 队列长度（任务槽总数）
+  struct ncclNetSocketTask* tasks;// 任务数组
 };
-
+//管理每个辅助线程的资源和状态
 struct ncclNetSocketThreadResources {
-  struct ncclNetSocketTaskQueue threadTaskQueue;
-  int stop;
-  struct ncclNetSocketComm* comm;
-  pthread_mutex_t threadLock;
-  pthread_cond_t  threadCond;
+  struct ncclNetSocketTaskQueue threadTaskQueue;// 线程专用的任务队列，存储该线程需要处理的通信任务
+  int stop;  // 控制线程终止的标志位，当设置为1时，线程会退出循环并结束执行
+  struct ncclNetSocketComm* comm;// 指向所属通信对象的指针,使线程能够访问通信相关的资源
+  pthread_mutex_t threadLock;//访问任务队列时使用
+  pthread_cond_t  threadCond;//用于主线程通知辅助线程有新任务，或者让辅助线程在空闲时等待
 };
-
+//表示一个监听通信对象
 struct ncclNetSocketListenComm {
-  struct ncclSocket sock;
-  struct ncclNetSocketCommStage stage;
-  int nSocks;
-  int nThreads;
-  int dev;
+  struct ncclSocket sock; // 监听套接字，用于接受连接请求
+  struct ncclNetSocketCommStage stage;// 连接状态信息，用于非阻塞连接处理
+  int nSocks;// 每个通信通道使用的并行套接字数量
+  int nThreads;// 处理通信的线程数量
+  int dev;// 关联的网络设备ID
 };
-
+//表示一个完整的通信对象，包含发送或接收数据所需的所有资源
 struct ncclNetSocketComm {
-  struct ncclSocket ctrlSock;
-  struct ncclSocket socks[MAX_SOCKETS];
+  struct ncclSocket ctrlSock;// 控制套接字，用于传输元数据
+  struct ncclSocket socks[MAX_SOCKETS];/ 数据套接字数组，用于并行传输数据
   int dev;
   int cudaDev;
-  int nSocks;
-  int nThreads;
-  int nextSock;
-  struct ncclNetSocketRequest requests[MAX_REQUESTS];
-  pthread_t helperThread[MAX_THREADS];
-  struct ncclNetSocketThreadResources threadResources[MAX_THREADS];
+  int nSocks; // 实际使用的套接字数量
+  int nThreads; // 实际使用的线程数量
+  int nextSock;// 下一个要使用的套接字索引，用于轮询分配
+  struct ncclNetSocketRequest requests[MAX_REQUESTS]; // 请求数组，存储活跃的通信请求
+  pthread_t helperThread[MAX_THREADS]; // 辅助线程数组,这些线程负责实际的数据传输.
+  struct ncclNetSocketThreadResources threadResources[MAX_THREADS];//线程资源数组，每个线程对应一个资源结构
 };
 
 void* persistentSocketThread(void *args_) {
@@ -325,13 +341,19 @@ fail:
   free(comm);
   goto exit;
 }
-
+//非阻塞式的连接建立过程，允许NCCL在高并发环境中高效地建立多个连接。opaqueHandle : 包含远程节点连接信息的句柄,sendDevComm : 设备卸载相关参数（Socket后端不使用）
+//sendComm 封装了发送端所需的所有资源和状态。
 ncclResult_t ncclNetSocketConnect(int dev, void* opaqueHandle, void** sendComm, ncclNetDeviceHandle_t** /*sendDevComm*/) {
   if (dev < 0 || dev >= ncclNetIfs) { // data transfer socket is based on specified dev
     return ncclInternalError;
   }
 
   int ready;
+  /*
+  - 从句柄中提取连接状态信息
+  - 根据当前状态决定跳转到哪个阶段
+  - 如果是首次调用，分配通信对象并初始化
+  */
   struct ncclNetSocketHandle* handle = (struct ncclNetSocketHandle*) opaqueHandle;
   struct ncclNetSocketCommStage* stage = &handle->stage;
   struct ncclNetSocketComm* comm = stage->comm;
@@ -341,28 +363,42 @@ ncclResult_t ncclNetSocketConnect(int dev, void* opaqueHandle, void** sendComm, 
 
   if (stage->state == ncclNetSocketCommStateConnect) goto socket_connect_check;
   if (stage->state == ncclNetSocketCommStateSend) goto socket_send;
-
+  //如果是首次调用，分配通信对象并初始化
   NCCLCHECK(ncclCalloc(&comm, 1));
   stage->comm = comm;
   comm->nSocks = handle->nSocks;
   comm->nThreads = handle->nThreads;
   comm->dev = dev;
   CUDACHECK(cudaGetDevice(&comm->cudaDev));
-  for (; i<comm->nSocks+1; i++) {
+  /*
+    - 为每个数据通道和控制通道创建套接字
+    - 初始化套接字并尝试连接
+    - 检查连接是否就绪，如果未就绪则返回（非阻塞）
+    - 连接就绪后，更新状态为发送阶段
+  */
+  for (; i<comm->nSocks+1; i++) {//这里nSocks+1是因为还要建立一个控制socket连接。
     sock = (i == comm->nSocks) ? &comm->ctrlSock : comm->socks+i;
+    //每个socket都是连接目标地址的
     NCCLCHECK(ncclSocketInit(sock, &handle->connectAddr, handle->magic, ncclSocketTypeNetSocket, NULL, 1));
 
     stage->sock = sock;
-    stage->state = ncclNetSocketCommStateConnect;
-    stage->iteration = i;
+    stage->state = ncclNetSocketCommStateConnect;//连接中
+    stage->iteration = i;//socket索引
     NCCLCHECK(ncclSocketConnect(sock));
 
 socket_connect_check:
     NCCLCHECK(ncclSocketReady(sock, &ready));
-    if (! ready) return ncclSuccess;
-    stage->state = ncclNetSocketCommStateSend;
+    if (! ready) return ncclSuccess;//这是NCCL中实现非阻塞连接的关键机制。由于TCP连接建立需要时间（三次握手过程），NCCL不会阻塞等待连接完成，而是通过这种方式实现异步连接
+    stage->state = ncclNetSocketCommStateSend;//连接成功，准备发送数据。
 
 socket_send:
+/*
+    - 向远程节点发送套接字索引（i）
+  - 如果发送未完成，返回（非阻塞）
+  - 所有套接字都连接并发送索引后，设置输出参数并返回
+  //这里发送变量 i 的目的是为了告知接收端当前套接字的用途和身份- 当 i == nSocks 时，表示这是控制套接字,当 i < nSocks 时，表示这是第 i 个数据套接字
+  接收端根据接收到的索引，接收端可以正确地将套接字映射到对应的位置。
+*/
     int done = 0;
     NCCLCHECK(ncclSocketProgress(NCCL_SOCKET_SEND, sock, &i, sizeof(uint8_t), &done));
     if (done == 0) return ncclSuccess;

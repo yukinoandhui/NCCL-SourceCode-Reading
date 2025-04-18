@@ -1770,17 +1770,20 @@ void* ncclProxyServiceUDS(void* _args) {
   INFO(NCCL_PROXY, "[Proxy Service UDS] exit: stop %d abortFlag %d", proxyState->stop, *proxyState->abortFlag);
   return NULL;
 }
-
+/*
+每个rank只有一个主要的代理服务线程（加上一个辅助的UDS服务线程）来处理与其他所有rank之间的通信。
+- 不需要为每个连接创建单独的线程
+*/
 ncclResult_t ncclProxyInit(struct ncclComm* comm, struct ncclSocket* sock, union ncclSocketAddress* peerAddresses, uint64_t *peerAddressesUDS) {
-  assert(comm->sharedRes->proxyState == NULL);
-  NCCLCHECK(ncclCalloc(&comm->sharedRes->proxyState, 1));
+  assert(comm->sharedRes->proxyState == NULL);//确保代理状态尚未初始化
+  NCCLCHECK(ncclCalloc(&comm->sharedRes->proxyState, 1));//为代理状态分配内存
   comm->proxyState = comm->sharedRes->proxyState;
-  comm->proxyState->refCount = 1;
+  comm->proxyState->refCount = 1;//refCount = 1 表示初始化时只有一个引用计数，这不是指线程数量，而是指有多少个通信上下文共享这个代理状态
   comm->proxyState->listenSock = sock;
   comm->proxyState->peerAddresses = peerAddresses;
   comm->proxyState->peerAddressesUDS = peerAddressesUDS;
 
-  // UDS support
+  // UDS support 初始化IPC套接字（Unix域套接字、无连接SOCK_DGRAM）用于进程间通
   NCCLCHECK(ncclIpcSocketInit(&comm->proxyState->ipcSock, comm->rank, peerAddressesUDS[comm->rank], comm->abortFlag));
   return ncclSuccess;
 }

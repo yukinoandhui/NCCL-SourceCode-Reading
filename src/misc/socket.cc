@@ -24,14 +24,14 @@ static void msleep(unsigned int time_msec) {
   };
   nanosleep(&tv, NULL);
 }
-
+//尝试发送/接收数据，但每次只处理部分数据
 static ncclResult_t socketProgressOpt(int op, struct ncclSocket* sock, void* ptr, int size, int* offset, int block, int* closed) {
   int bytes = 0;
   *closed = 0;
   char* data = (char*)ptr;
   char line[SOCKET_NAME_MAXLEN+1];
   do {
-    if (op == NCCL_SOCKET_RECV) bytes = recv(sock->fd, data+(*offset), size-(*offset), block ? 0 : MSG_DONTWAIT);
+    if (op == NCCL_SOCKET_RECV) bytes = recv(sock->fd, data+(*offset), size-(*offset), block ? 0 : MSG_DONTWAIT);//使用 MSG_DONTWAIT 实现非阻塞操作
     if (op == NCCL_SOCKET_SEND) bytes = send(sock->fd, data+(*offset), size-(*offset), block ? MSG_NOSIGNAL : MSG_DONTWAIT | MSG_NOSIGNAL);
     if (op == NCCL_SOCKET_RECV && bytes == 0) {
       *closed = 1;
@@ -55,13 +55,13 @@ static ncclResult_t socketProgressOpt(int op, struct ncclSocket* sock, void* ptr
       INFO(NCCL_NET, "socketProgressOpt: abort called");
       return ncclInternalError;
     }
-  } while (sock->asyncFlag == 0 && bytes > 0 && (*offset) < size);
+  } while (sock->asyncFlag == 0 && bytes > 0 && (*offset) < size);//如果不指定异步，那这里会一直阻塞（同步模式）。
   return ncclSuccess;
 }
 
 static ncclResult_t socketProgress(int op, struct ncclSocket* sock, void* ptr, int size, int* offset, int* pclosed = NULL) {
   int closed;
-  NCCLCHECK(socketProgressOpt(op, sock, ptr, size, offset, 0 /*block*/, &closed));
+  NCCLCHECK(socketProgressOpt(op, sock, ptr, size, offset, 0 /*block*/, &closed));//固定使用非阻塞模式（block=0）
   if (closed) {
     if (pclosed) {
       *pclosed = closed;
@@ -417,7 +417,7 @@ ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
   sock->state = ncclSocketStateReady;
   return ncclSuccess;
 }
-
+//把sock里面地址拷贝到addr中
 ncclResult_t ncclSocketGetAddr(struct ncclSocket* sock, union ncclSocketAddress* addr) {
   if (sock == NULL) {
     WARN("ncclSocketGetAddr: pass NULL socket");
@@ -797,7 +797,8 @@ fail:
   }
   goto exit;
 }
-
+//NCCL中用于处理套接字非阻塞I/O操作的关键函数。这个函数是对内部 socketProgress 函数的公开封装，提供了错误检查和参数验证功能。
+//尝试发送或接收数据，但不会阻塞等待操作完成
 ncclResult_t ncclSocketProgress(int op, struct ncclSocket* sock, void* ptr, int size, int* offset, int* closed) {
   if (sock == NULL) {
     WARN("ncclSocketProgress: pass NULL socket");
