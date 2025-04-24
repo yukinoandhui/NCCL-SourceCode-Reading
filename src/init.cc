@@ -549,44 +549,45 @@ static void showVersion() {
 
 NCCL_PARAM(MNNVLUUID, "MNNVL_UUID", -1);
 NCCL_PARAM(MNNVLCliqueId, "MNNVL_CLIQUE_ID", -1);
-
+//commHash是uniqueId得到的。
 static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, uint64_t commHash) {
   info->rank = comm->rank;
   info->cudaDev = comm->cudaDev;
-  info->nvmlDev = comm->nvmlDev;
+  info->nvmlDev = comm->nvmlDev;// NVML设备号
   NCCLCHECK(ncclGetVersion(&info->version));
-  info->hostHash=getHostHash()+commHash;
-  info->pidHash=getPidHash()+commHash;
-  info->cuMemSupport = ncclCuMemEnable();
+  info->hostHash=getHostHash()+commHash; // 主机唯一标识（加上commHash保证唯一性）
+  info->pidHash=getPidHash()+commHash;// 进程唯一标识（加上commHash保证唯一性）
+  info->cuMemSupport = ncclCuMemEnable();//是否使用cuMem*系列函数分配内存。
 
   // Get the device MAJOR:MINOR of /dev/shm so we can use that
   // information to decide whether we can use SHM for inter-process
   // communication in a container environment
   struct stat statbuf;
-  SYSCHECK(stat("/dev/shm", &statbuf), "stat");
+  SYSCHECK(stat("/dev/shm", &statbuf), "stat");// 获取 /dev/shm 的设备号，用于判断容器环境下是否能用SHM做进程间通信
   info->shmDev = statbuf.st_dev;
 
-  info->busId = comm->busId;
+  info->busId = comm->busId;//PCIe总线ID（通常称为BDF：Bus:Device.Function）是每个PCIe设备在主板PCIe拓扑中的唯一标识符
+  //即使同一台机器有多块相同型号的GPU，也能通过PCIe总线ID区分。用于判断GPU之间的物理连接关系.很多底层库（如NVML）通过PCIe总线ID定位和操作具体的GPU。
 
-  NCCLCHECK(ncclGpuGdrSupport(comm, &info->gdrSupport));
+  NCCLCHECK(ncclGpuGdrSupport(comm, &info->gdrSupport));// 是否支持GDR
   info->comm = comm;
   info->cudaCompCap = comm->minCompCap = comm->maxCompCap = comm->compCap;
 
-  // MNNVL support
+  // MNNVL support MNNVL（Multi-Node NVLink）支持相关信息
   {
     // MNNVL: Request the fabric UUID and partition info
     char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
     nvmlDevice_t nvmlDev;
-    NCCLCHECK(int64ToBusId(info->busId, busId));
-    NCCLCHECK(ncclNvmlDeviceGetHandleByPciBusId(busId, &nvmlDev));
+    NCCLCHECK(int64ToBusId(info->busId, busId));// 将PCIe总线ID转为字符串格式
+    NCCLCHECK(ncclNvmlDeviceGetHandleByPciBusId(busId, &nvmlDev));//通过PCIe总线ID获取当前GPU的NVML句柄
     info->fabricInfo.state = NVML_GPU_FABRIC_STATE_NOT_SUPPORTED;
-    (void) ncclNvmlDeviceGetGpuFabricInfoV(nvmlDev, &info->fabricInfo);
-    if (info->fabricInfo.state != NVML_GPU_FABRIC_STATE_NOT_SUPPORTED) {
+    (void) ncclNvmlDeviceGetGpuFabricInfoV(nvmlDev, &info->fabricInfo); // 查询Fabric信息（如UUID、cliqueId等）
+    if (info->fabricInfo.state != NVML_GPU_FABRIC_STATE_NOT_SUPPORTED) {// 如果支持Fabric，允许通过环境变量覆盖UUID和cliqueId
       if (ncclParamMNNVLUUID() != -1) {
-        ((long*)&info->fabricInfo.clusterUuid)[0] = ncclParamMNNVLUUID();
+        ((long*)&info->fabricInfo.clusterUuid)[0] = ncclParamMNNVLUUID();//所在NVLink Fabric集群的UUID
         ((long*)&info->fabricInfo.clusterUuid)[1] = ncclParamMNNVLUUID();
       }
-      if (ncclParamMNNVLCliqueId() != -1) info->fabricInfo.cliqueId = ncclParamMNNVLCliqueId();
+      if (ncclParamMNNVLCliqueId() != -1) info->fabricInfo.cliqueId = ncclParamMNNVLCliqueId();//分区ID
       INFO(NCCL_INIT, "MNNVL busId 0x%lx fabric UUID %lx.%lx cliqueId 0x%x state %d healthMask 0x%x",
            info->busId,
            ((long *)&info->fabricInfo.clusterUuid)[0], ((long *)&info->fabricInfo.clusterUuid)[1],
@@ -677,7 +678,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   ncclResult_t ret = ncclSuccess;
   int rank = comm->rank;
   int nranks = comm->nRanks;
-  int nNodes = 1;
+  int nNodes = 1;//表示 当前通信组（uniqueId）中涉及到的物理节点（主机）数量 。
   cpu_set_t affinitySave; //CPU亲和性
   struct ncclTopoGraph* ringGraph = &comm->graphs[NCCL_ALGO_RING];
   struct ncclTopoGraph* treeGraph = &comm->graphs[NCCL_ALGO_TREE];
@@ -698,27 +699,27 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   };
 
   struct allGatherInfo {
-    struct graphInfo graphInfo[NCCL_NUM_ALGORITHMS];
-    struct ncclTopoRanks topoRanks;
-    int cpuArch;
-    int cpuVendor;
+    struct graphInfo graphInfo[NCCL_NUM_ALGORITHMS];// 存储每种算法的拓扑图信息（如通道数、带宽等）
+    struct ncclTopoRanks topoRanks; // 存储每种算法下各通道的rank关系（如环、树等）
+    int cpuArch;// 本节点CPU架构
+    int cpuVendor;// 本节点CPU厂商
   };
 
   int nChannelsOrig;
-  struct allGatherInfo *allGather3Data = NULL;
-  struct ncclTopoRanks** allTopoRanks = NULL;
-  int *nodesFirstRank = NULL, *nodesTreePatterns = NULL;
-  int *rings = NULL;
-  int* nvbPeers = NULL;
-  struct ncclProxyConnector proxyConn;
-  int* pxnPeers = NULL;
-  int *topParentLocalRanks = NULL;
+  struct allGatherInfo *allGather3Data = NULL;// 用于AllGather3阶段，收集所有rank的拓扑和rank关系信息
+  struct ncclTopoRanks** allTopoRanks = NULL;// 指向所有rank的topoRanks指针数组
+  int *nodesFirstRank = NULL, *nodesTreePatterns = NULL;// 记录每个节点的第一个rank和树模式
+  int *rings = NULL; // 存储环结构信息
+  int* nvbPeers = NULL; // NVB相关的peer信息.NVB 连接是针对非 NVSwitch 系统的优化，其中使用GPU的内存来进行GPU之间的P2P通信，这些GPU不是通过NVLink直接连接的。
+  struct ncclProxyConnector proxyConn; // 代理连接器
+  int* pxnPeers = NULL;   // PXN相关的peer信息
+  int *topParentLocalRanks = NULL;  // 父通信器的本地rank映射
 
   timers[TIMER_INIT_ALLGATHER] = clockNano();
   // AllGather1 - begin
-  NCCLCHECKGOTO(ncclCalloc(&comm->peerInfo, nranks+1), ret, fail); // Extra rank to represent CollNet root
-  NCCLCHECKGOTO(fillInfo(comm, comm->peerInfo+rank, comm->commHash), ret, fail);
-  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->peerInfo, sizeof(struct ncclPeerInfo)), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&comm->peerInfo, nranks+1), ret, fail); // Extra rank to represent CollNet root,分配peerInfo数组，+1用于CollNet root
+  NCCLCHECKGOTO(fillInfo(comm, comm->peerInfo+rank, comm->commHash), ret, fail);// 填充本rank的peerInfo
+  NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->peerInfo, sizeof(struct ncclPeerInfo)), ret, fail);// 全部rank同步peerInfo
 
   comm->cuMemSupport = 1;
   for (int i = 0; i < nranks; i++) {
@@ -728,7 +729,12 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       ret = ncclInvalidUsage;
       goto fail;
     }
-    if (comm->peerInfo[i].hostHash != comm->peerInfo[rank].hostHash) nNodes++;
+    /*
+    这种写法实际上会把每遇到一个不同主机的 rank 就加一，初始值为 1（当前节点），但如果有多个 rank 分布在同一主机上，
+    这种计数方式会重复计数，实际代码后续会有更精确的去重和统计逻辑。这里的 nNodes 只是一个初步估算，用于后续判断是否为多节点通信环境。
+    例如，假设有 3 个 rank，分布在 2 个不同的主机上（当前主机一个rank，另一个主机两个rank），nNodes 的值会是 3。
+    */
+    if (comm->peerInfo[i].hostHash != comm->peerInfo[rank].hostHash) nNodes++;//粗略统计。
     if (!comm->peerInfo[i].cuMemSupport) comm->cuMemSupport = 0;
     if ((i != rank) && (comm->peerInfo[i].hostHash == comm->peerInfo[rank].hostHash) && (comm->peerInfo[i].busId == comm->peerInfo[rank].busId)) {
       WARN("Duplicate GPU detected : rank %d and rank %d both on CUDA device %lx", rank, i, comm->peerInfo[rank].busId);
@@ -740,25 +746,35 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   timers[TIMER_INIT_ALLGATHER] = clockNano() - timers[TIMER_INIT_ALLGATHER];
 
   // Check for MNNVL support
+  /*
+    如果是多节点（ nNodes > 1 ）并且没有显式禁用 MNNVL（ ncclParamMNNVLEnable() != 0 ）， 或者 用户强制要求启用 MNNVL（ ncclParamMNNVLEnable() == 1 ），
+    就会调用 ncclMnnvlCheck(comm) ，进行 MNNVL 相关的检查和初始化。
+  */
   if ((nNodes > 1 && ncclParamMNNVLEnable() != 0) || ncclParamMNNVLEnable() == 1) {
     NCCLCHECKGOTO(ncclMnnvlCheck(comm), ret, fail);
   }
 
   do {
-    // Compute intra-process ranks
+    // Compute intra-process ranks 计算进程内 rank 关系和注册支持情况
+    /*一个进程内可能有多个rank。getpid获取的是当前进程的pid，对于多线程的进程来讲，getpid获取的是主线程的id。对于只有一个线程的进程来说，内核角度pid就是tid
+      - intraProcRank0 ：进程内第一个 rank 的全局 rank。
+- intraProcRank ：当前 rank 在进程内的编号。
+- intraProcRanks ：当前进程内的 rank 总数。
+    */
     int intraProcRank0 = -1, intraProcRank = -1, intraProcRanks = 0;
+    //计算通信组内的最小和最大 CUDA 计算能力
     for (int i = 0; i < nranks; i++) comm->minCompCap = std::min(comm->minCompCap, comm->peerInfo[i].cudaCompCap);
     for (int i = 0; i < nranks; i++) comm->maxCompCap = std::max(comm->maxCompCap, comm->peerInfo[i].cudaCompCap);
 
     comm->nvlsRegSupport = 1;
     for (int i = 0; i < nranks; i++) {
       if ((comm->peerInfo[i].hostHash == comm->peerInfo[rank].hostHash)
-          && (comm->peerInfo[i].pidHash == comm->peerInfo[rank].pidHash)) {
+          && (comm->peerInfo[i].pidHash == comm->peerInfo[rank].pidHash)) {//遍历所有 rank，判断哪些 rank 与当前 rank 在同一主机同一进程
         // Rank is in same process
-        if (intraProcRanks == 0) intraProcRank0 = i;
-        if (i == rank) intraProcRank = intraProcRanks;
+        if (intraProcRanks == 0) intraProcRank0 = i;//记录第一个进程内 rank 的全局 rank
+        if (i == rank) intraProcRank = intraProcRanks;//记录当前 rank 在进程内的编号,从0开始。
         intraProcRanks++;
-        if (intraProcRank0 == rank && rank != i) {
+        if (intraProcRank0 == rank && rank != i) {//构建进程内通信器链表。没有顺序要求。
           comm->peerInfo[i].comm->intraNext = comm->intraNext;
           comm->intraNext = comm->peerInfo[i].comm;
         }
@@ -767,15 +783,17 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       if (comm->nvlsRegSupport) {
         for (int j = i + 1; j < nranks; j++) {
           if (comm->peerInfo[i].hostHash == comm->peerInfo[j].hostHash &&
-            comm->peerInfo[i].pidHash == comm->peerInfo[j].pidHash) {
-            comm->nvlsRegSupport = 0;
+            comm->peerInfo[i].pidHash == comm->peerInfo[j].pidHash) {//如果发现有两个 rank 在同一主机同一进程，则不支持 NVLS 注册
+            comm->nvlsRegSupport = 0;//保证 NVLS 注册的唯一性和一致性
             break;
           }
         }
       }
     }
 
-    // Buffer Registration is not supported with MNNVL
+    // Buffer Registration is not supported with MNNVL。如果启用了 MNNVL，则 不支持 NVLS（NVLink SHARP）注册
+    //  MNNVL 和 NVLS 都是 NVIDIA 针对多节点/多 GPU 通信的高性能优化技术，但它们的底层实现和资源管理方式不同。
+    // 当启用 MNNVL 时，NCCL 需要采用专门的内存注册和通信机制，这与 NVLS 注册机制不兼容。
     if (comm->MNNVL) comm->nvlsRegSupport = 0;
 
     TRACE(NCCL_INIT,"pidHash[%d] %lx intraProcRank %d intraProcRanks %d intraProcRank0 %d",
@@ -787,11 +805,13 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       ret = ncclInternalError;
       goto fail;
     }
+    //设置进程内通信相关属性
     struct ncclComm* comm0 = comm->peerInfo[intraProcRank0].comm;
     assert(intraProcRank==0 ? comm==comm0 : true);
     comm->intraComm0 = comm0;
     comm->intraRank = intraProcRank;
     comm->intraRanks = intraProcRanks;
+    //用于进程内同步（如屏障）的状态变量。
     comm->intraBarrierPhase = 0;
     comm->intraBarrierCounter = 0;
     comm->intraBarrierGate = 0;
@@ -802,23 +822,23 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   // Dump XML if requested by user
   const char* dumpXmlFile;
   dumpXmlFile = ncclGetEnv("NCCL_TOPO_DUMP_FILE");
-  if (dumpXmlFile) {
+  if (dumpXmlFile) {//可选地将当前系统拓扑导出为 XML 文件
     NCCLCHECKGOTO(ncclTopoGetSystem(comm, NULL, dumpXmlFile), ret, fail);
   }
-
+  //NCCL 通信组的 硬件拓扑发现与系统图的构建
   // Topo detection / System graph creation
   NCCLCHECKGOTO(ncclTopoGetSystem(comm, &comm->topo), ret, fail);
-  // Compute paths between GPUs and NICs
+  // Compute paths between GPUs and NICs 计算 GPU 与 NIC 之间的路径。
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
-  // Remove inaccessible GPUs and unused NICs
+  // Remove inaccessible GPUs and unused NICs 移除不可达的 GPU 和未使用的 NIC。
   NCCLCHECKGOTO(ncclTopoTrimSystem(comm->topo, comm), ret, fail);
-  // Recompute paths after trimming
+  // Recompute paths after trimming 再次计算路径，确保拓扑信息准确。
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
-  // Init search
+  // Init search 初始化拓扑搜索结构
   NCCLCHECKGOTO(ncclTopoSearchInit(comm->topo), ret, fail);
-  // Decide on comm's CPU architecture.
+  // Decide on comm's CPU architecture. 计算并设置通信器的 CPU 架构信息。
   NCCLCHECKGOTO(ncclTopoComputeCommCPU(comm), ret, fail);
-  // Print final topology
+  // Print final topology 打印最终的拓扑结构，便于日志分析和调试。
   NCCLCHECKGOTO(ncclTopoPrint(comm->topo), ret, fail);
   timers[TIMER_INIT_TOPO] = clockNano() - timers[TIMER_INIT_TOPO];
 

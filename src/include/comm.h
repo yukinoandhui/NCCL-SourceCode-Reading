@@ -589,10 +589,10 @@ struct ncclComm {
   struct ncclCollNetSharedRes* collNetSharedRes;
 
   // NVLink SHARP (NVLS) support
-  int nvlsSupport;
-  int nvlsRegSupport;
+  int nvlsSupport;//表示当前通信器是否支持 NVLS 功能
+  int nvlsRegSupport;//表示当前通信器是否支持 NVLS 注册相关的功能
   /* sharable NVLS resource. */
-  struct ncclNvlsSharedRes* nvlsResources;
+  struct ncclNvlsSharedRes* nvlsResources;//指向可共享的 NVLS 资源结构体，用于多通信器之间共享 NVLS 相关资源。
 
   // pools backed by comm->memPermanent
   struct ncclMemoryPool memPool_ncclTaskColl;

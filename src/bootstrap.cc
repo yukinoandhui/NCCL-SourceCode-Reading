@@ -819,7 +819,7 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   NCCLCHECKGOTO(getUDS(state->peerProxyAddressesUDS + rank), result, fail);// 生成当前rank的UDS地址。getUDS 函数生成一个唯一的UDS标识符
   /*
     专门用于点对点直接通信，主要用于简单的点对点直接通信
-    代理套接字需要通过代理服务线程处理，增加了一层间接性，P2P套接字直接在通信双方之间建立连接，避免了代理线程的调度和处理开销
+    代理套接字需要通过代理服务线程处理，增加了一层间接性，P2P套接字直接在通信双方之间建立连接，避免了代理线程的调度和处理开销(后面xml融合的时候会用到)
     ncclSocketTypeBootstrap 专门用于NCCL初始化阶段的通信
   */
   // create a socket for others to reach out (P2P)
@@ -1143,6 +1143,7 @@ static ncclResult_t socketRingAllGather(struct ncclSocket* sendSock, struct nccl
 exit:
   return res;
 }
+//allgather 让所有rank都获得data中的信息
 ncclResult_t bootstrapAllGather(void* commState, void* allData, int size) {
   ncclResult_t res = ncclSuccess;
   struct bootstrapState* state = (struct bootstrapState*)commState;
@@ -1209,6 +1210,7 @@ ncclResult_t bootstrapIntraNodeAllGather(void* commState, int* ranks, int rank, 
   int nextRank = ranks[(rank + 1) % nranks];
   // intraNode bootstrap is done defacto using the socket-based implementation
   struct ncclSocket recvSocket, sendSocket;
+  //这里会用到p2p的连接，在范围内建立一个环。 都是阻塞的。
   NCCLCHECK(socketConnect(commState, nextRank, BOOTSTRAP_TAG_INTRANODE_ALLGATHER, &sendSocket));
   NCCLCHECK(socketAccept(commState, prevRank, BOOTSTRAP_TAG_INTRANODE_ALLGATHER, &recvSocket));
 

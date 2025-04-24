@@ -22,9 +22,12 @@
 #define NCCL_PTR_DMABUF 0x4
 
 // Maximum number of requests per comm object
+// 表示每个通信对象（comm object）最多可以同时处理 32 个网络请求。这通常用于限制异步发送/接收等操作的并发数量，防止资源耗尽。
 #define NCCL_NET_MAX_REQUESTS 32
 
-// Max number of ncclNet objects which can live in the same process
+// Max number of ncclNet objects which can live in the same process.
+// 表示在同一个进程中，最多可以同时存在3个ncclNet 插件对象。也就是说，
+// NCCL 支持最多3种不同类型的网络插件（比如 IB、RoCE、TCP），用于不同的网络后端。
 #define NCCL_NET_MAX_PLUGINS 3
 
 //定义了每个网络接口卡(NIC)上最多可以支持的设备数量为4个
@@ -34,9 +37,15 @@
 
 //每个设备代表一个可以独立进行通信的通道,这些通道可以并行工作，提高总体带宽
 //例如，一个双端口的InfiniBand适配器可能会报告 ndevs=2 ，表示有两个可用的通信端口，NCCL可以同时利用这两个端口进行通信，从而获得更高的带宽。
+/*
+- 对于单端口网卡， ndevs 通常为 1。
+- 对于多端口网卡（如双端口、四端口的 InfiniBand 卡）， ndevs 就是实际可用的端口数，比如 2 或 4。
+- 对于支持虚拟化的网卡（如 SR-IOV），每个物理端口可以虚拟出多个虚拟功能（VF），此时 ndevs 也可以大于 1，表示虚拟出来的设备数量。
+*/
+//上面的注释是AI给的，但是通过看代码我理解的是：这个结构体就是记录虚拟网卡是由哪些设备合并而来。
 typedef struct {
   int ndevs;//实际设备数量，网络接口卡(NIC)上的虚拟或物理设备数量
-  int devs[NCCL_NET_MAX_DEVS_PER_NIC_V9];//设备ID数组，最多存储4个设备的ID
+  int devs[NCCL_NET_MAX_DEVS_PER_NIC_V9];//设备ID数组，最多存储4个设备的ID()
 } ncclNetVDeviceProps_v9_t;
 typedef ncclNetVDeviceProps_v9_t ncclNetVDeviceProps_t;
 
@@ -72,7 +81,7 @@ typedef struct {
 
   int forceFlush;                  // Force a flush on receives 是否在接收时强制刷新
   int speed;                       // Port speed in Mbps. 端口速度
-  int port;                        // Port number. 端口号
+  int port;                        // Port number. 端口号 这个端口号用于区分同一块网卡上的不同物理接口，通常和 /sys/class/infiniband/mlx5_0/ports/1
   float latency;                   // Network latency 网络延迟
   int maxComms;                    // Maximum number of comms we can create 可创建的最大通信对象数量
   int maxRecvs;                    // Maximum number of grouped receives. 分组接收的最大数量
@@ -147,6 +156,7 @@ typedef struct {
   ncclResult_t (*irecvConsumed)(void* recvComm, int n, void* request);
 
   // Create a virtual NIC given the specified properties, which can be accessed at device index d
+  //： 根据指定的属性（ props ），创建一个虚拟网卡（Virtual NIC，简称 VNIC），并返回其设备索引（ d ） 。
   ncclResult_t (*makeVDevice)(int* d, ncclNetVDeviceProps_t* props);
 } ncclNet_v9_t;
 

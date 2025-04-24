@@ -66,7 +66,7 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
 ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int64_t netId, int* gpuIndex);
 ncclResult_t getLocalNetCountByBw(struct ncclTopoSystem* system, int gpu, int *count);
 
-#define NCCL_TOPO_MAX_NODES 256
+#define NCCL_TOPO_MAX_NODES 256 //- 这个值是 单一节点（单机）内的最大节点数 ，不是整个集群的总 GPU 数。 这里的“节点”不仅仅指 GPU，还包括 CPU、PCI、NIC、NVS 等所有类型的拓扑节点。
 
 // Init search. Needs to be done before calling ncclTopoCompute
 ncclResult_t ncclTopoSearchInit(struct ncclTopoSystem* system);
@@ -117,7 +117,7 @@ struct ncclTopoRanks {
   int treeToChild0[MAXCHANNELS];// 每个通道中当前rank在树形通信中的第一个子节点rank
   int treeToChild1[MAXCHANNELS]; // 每个通道中当前rank在树形通信中的第二个子节点rank
   int nvlsHeads[MAXCHANNELS];// NVLS算法中，每个通道的head节点rank
-  int nvlsHeadNum; // NVLS算法中head节点的数量
+  int nvlsHeadNum; // NVLS算法中head节点的数量  NVLink SHARP
   /*NVLS算法利用NVLink带宽在节点内高效聚合/分发数据，然后通过少量head节点与外部网络通信，实现节点间高效数据交换 。
   节点内所有GPU通过NVLink高速互联，形成一个高带宽的“全互连”或“近似全互连”结构。每个节点只选取少数几个GPU作为“head节点”（通常是与NIC直连或带宽最优的GPU）
   只有head节点负责与其他节点的head节点进行跨节点通信（通常通过InfiniBand/Ethernet等网络）。

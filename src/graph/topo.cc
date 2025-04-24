@@ -714,9 +714,12 @@ static ncclResult_t xmlInitAttrFloat(struct ncclXmlNode* node, const char* attrN
   }
   return ncclSuccess;
 }
-
+//刷新 Broadcom（BCM） PCIe 交换机的 P2P（Peer-to-Peer）拓扑信息 ，以确保 NCCL 能够获取到最新的 PCIe 拓扑结构
 ncclResult_t ncclTopoRefreshBcmP2pLinks(void) {
   //refresh the switch topology by reading the link below
+  //通过读取的这个动作，触发内核或驱动刷新 PCIe 交换机的拓扑信息
+  //主要针对 Broadcom（BCM）等 PCIe 交换机，因为这些交换机的拓扑可能会动态变化（比如设备热插拔、链路变化等）。
+  //这是 Linux 下常见的“驱动接口”方式：驱动开发者会在 /sys 下暴露一些特殊文件，用户空间只要读/写这些文件，驱动就会执行相应的操作（比如刷新硬件状态、重建拓扑等）
   FILE *fp = fopen("/sys/kernel/pci_switch_link/refresh_switch_toplogy", "r");
   if (fp != NULL) {
     int tmp;
@@ -791,6 +794,38 @@ typedef struct xmlNodeStack {
 } xmlNodeStack;
 
 // 1. Find the common parent xmlNode between the given set of nodes
+/*
+用于判断一组节点（通常是物理网卡节点）在 NCCL 拓扑 XML 树中的“共同父节点”以及它们之间的路径类型（如是否同一端口、同一PCI树、跨NUMA等），
+并返回路径类型和共同父节点指针。
+多端口（multi-port）判断是为了支持多端口网卡或 SR-IOV 场景的特殊合并需求。
+假设一台服务器上有一块物理网卡（NIC），但这块网卡有两个物理端口（比如 Infiniband HCA 的 port 1 和 port 2），并且这两个端口都被操作系统识别为独立的网络接口（如 mlx5_0/port1 和 mlx5_0/port2）。
+
+在 NCCL 拓扑 XML 中，通常会有如下结构（伪代码）：
+
+<system>
+  ...
+  <nic>
+    <net name="mlx5_0_port1" dev="0" guid="0x1234" port="1"/>
+    <net name="mlx5_0_port2" dev="1" guid="0x1234" port="2"/>
+  </nic>
+  ...
+</system>
+
+### 合并前
+- mlx5_0_port1 和 mlx5_0_port2 是两个独立的 net 节点。
+- 但它们的父节点都是同一个 <nic> ，且 guid 相同，只是 port 不同。
+### 多端口判断的作用
+在 NCCL 拓扑合并时，会判断这些 net 节点的父节点（即 <nic> ）是否相同，或者它们的 busid 除了最后一位（port号）外是否一致。
+
+- 如果一致，就认为它们属于同一块物理网卡的不同端口，可以合并为一个虚拟网卡（VNIC）。
+### 合并后
+NCCL 会把这两个端口合并为一个虚拟网卡节点，后续通信调度时可以统一管理和优化。
+
+
+在 ncclTopoGetPath 里，会有类似如下逻辑：
+
+- 如果多个 net 节点的父节点 busid 除了最后一位都相同（即同一物理卡的不同端口），则路径类型为 PATH_PORT ，允许合并。
+*/
 ncclResult_t ncclTopoGetPath(ncclXmlNode** nodes, int nNodes, int* path, ncclXmlNode** parent) {
   // Track a stack of parents per-net node being merged
   xmlNodeStack* parents;
@@ -950,7 +985,7 @@ ncclResult_t ncclTopoMakePciParent(struct ncclXml* xml, struct ncclXmlNode** par
 
   return ncclSuccess;
 }
-
+//这个函数应该是不完整的，还没完全实现，
 ncclResult_t ncclTopoMakeVnic(ncclComm_t comm, struct ncclXml* xml, ncclNetVDeviceProps_t* vProps,
 struct ncclXmlNode** physNetNodes, struct ncclXmlNode** netNode, ncclResult_t (*makeVDevice)(int*, ncclNetVDeviceProps_t*)) {
   if (vProps->ndevs > NCCL_NET_MAX_DEVS_PER_NIC) {
@@ -960,7 +995,7 @@ struct ncclXmlNode** physNetNodes, struct ncclXmlNode** netNode, ncclResult_t (*
 
   // Trigger the merge, then get the new device's properties
   int vDevIndex = 0;
-  ncclResult_t ret = makeVDevice(&vDevIndex, vProps);
+  ncclResult_t ret = makeVDevice(&vDevIndex, vProps);//根据指定的属性（ props ），创建一个虚拟网卡（Virtual NIC，简称 VNIC），并返回其设备索引（ d ） 
   if (ret == ncclInvalidUsage) {
     WARN("TOPO/NET : Tried merging multiple devices together and failed. Try setting NCCL_NET_MERGE_LEVEL=LOC");
     NCCLCHECK(ret);
@@ -1015,10 +1050,10 @@ ncclResult_t ncclTopoForceMerge(ncclComm_t comm, struct ncclXml* xml, char* str,
 
   return ncclSuccess;
 }
-
+//根据物理网卡之间的拓扑距离（路径类型），自动将距离足够近的物理网卡合并为一个虚拟网卡节点，插入到 NCCL 拓扑结构中。
 ncclResult_t ncclTopoAutoMerge(ncclComm_t comm, struct ncclXml* xml, int mergeLevel, int* placedDevs, ncclNetProperties_t* propsList, struct ncclXmlNode** physNetNodes, int nPhysDevs, ncclResult_t (*makeVDevice)(int*, ncclNetVDeviceProps_t*)) {
   // Compute the path type between each device
-  int* paths = NULL;
+  int* paths = NULL; //为所有物理网卡节点两两之间分配一个路径类型数组 paths ，用于存储它们之间的“距离”或“拓扑路径类型”。
   ncclResult_t res = ncclSuccess;
   ncclCalloc(&paths, nPhysDevs*nPhysDevs);
   TRACE(NCCL_GRAPH, "Allocated %d paths", nPhysDevs*nPhysDevs);
@@ -1028,23 +1063,28 @@ ncclResult_t ncclTopoAutoMerge(ncclComm_t comm, struct ncclXml* xml, int mergeLe
       nodes[0] = physNetNodes[i];
       nodes[1] = physNetNodes[j];
       struct ncclXmlNode* parent;
-      NCCLCHECKGOTO(ncclTopoGetPath(nodes, 2, &paths[i*nPhysDevs + j], &parent), res, out);
+      NCCLCHECKGOTO(ncclTopoGetPath(nodes, 2, &paths[i*nPhysDevs + j], &parent), res, out);//计算每对物理网卡节点之间的路径类型
+      //这样后续可以根据路径类型决定哪些物理网卡可以合并为一个虚拟网卡
     }
   }
+ 
+  //合并物理网卡为虚拟网卡
 
   // Place all remaining physical devices into a virtual device given the mergeLevel criteria
   for (int i = 0; i < nPhysDevs; i++) {
     // Select the first unplaced device "i" as the root
+    //外层循环遍历所有物理网卡，找到第一个还未被合并（ placedDevs[i] == 0 ）的设备 i，作为新虚拟网卡的“根”
     if (placedDevs[i] == 0) {
       // Init a new vDevice
-      ncclNetVDeviceProps_t vProps;
+      ncclNetVDeviceProps_t vProps; //初始化一个新的虚拟网卡属性结构体 vProps ，并把 i 加入其中，标记为已合并。
       vProps = {0};
-      vProps.devs[vProps.ndevs++] = i;
-      placedDevs[i] = 1;
+      vProps.devs[vProps.ndevs++] = i;//设备ID为i
+      placedDevs[i] = 1;//标记为已合并。
       TRACE(NCCL_GRAPH, "Placed dev %d", i);
 
       // Select each unplaced device "j" which is at most "mergeLevel" distance from "i", but not equal to "i"
       // (Don't merge the same device with itself)
+      //内层循环遍历所有未被合并的设备 j，如果 j 到 i 的路径类型小于等于 mergeLevel （即拓扑距离足够近），则也加入到当前虚拟网卡中，并标记为已合并。
       for (int j = 0; j < nPhysDevs; j++) {
         if (paths[i*nPhysDevs + j] <= mergeLevel &&
         placedDevs[j] == 0 && j != i) {
@@ -1052,14 +1092,14 @@ ncclResult_t ncclTopoAutoMerge(ncclComm_t comm, struct ncclXml* xml, int mergeLe
           placedDevs[j] = 1;
           TRACE(NCCL_GRAPH, "Placed dev %d path=%d", j, paths[i*nPhysDevs + j] );
         }
-        if (vProps.ndevs == NCCL_NET_MAX_DEVS_PER_NIC) break;
+        if (vProps.ndevs == NCCL_NET_MAX_DEVS_PER_NIC) break;//每个虚拟网卡最多合并 NCCL_NET_MAX_DEVS_PER_NIC 个物理网卡，超过则报错。
       }
 
       if (vProps.ndevs > NCCL_NET_MAX_DEVS_PER_NIC) {
         WARN("TOPO/NET : Tried to merge too many NICs. %d > %d", vProps.ndevs, NCCL_NET_MAX_DEVS_PER_NIC);
         return ncclInternalError;
       }
-
+      //合并完成后，调用 ncclTopoMakeVnic 创建虚拟网卡节点，并插入到拓扑结构中。
       struct ncclXmlNode* netNode;
       NCCLCHECKGOTO(ncclTopoMakeVnic(comm, xml, &vProps, physNetNodes, &netNode, makeVDevice), res, out);
     }
@@ -1080,10 +1120,15 @@ struct kvDict nicPathKvList[] = {
   { "SYS",  PATH_SYS },
   { NULL, 0 }
 };
+//为虚拟网卡（vNIC）在 NCCL 拓扑 XML 中找到合适的父节点（parent），以便正确插入到系统拓扑结构中。
+// 如果需要，还会为虚拟网卡构造一个虚拟的 PCI 父节点，保证拓扑结构的合理性和一致性。
 
 ncclResult_t ncclTopoGetVNicParent(struct ncclXml* xml, ncclResult_t (*getProperties)(int, ncclNetProperties_t*), ncclNetVDeviceProps_t* vProps, ncclXmlNode** parent) {
   ncclNetProperties_t props[NCCL_NET_MAX_DEVS_PER_NIC];
   ncclXmlNode* physNetNodes[NCCL_NET_MAX_DEVS_PER_NIC];
+  //获取每个物理网卡的属性，并在 XML 中查找对应的 net 节点，保存到 physNetNodes 数组。
+  
+
   for (int i = 0; i < vProps->ndevs; i++) {
     NCCLCHECK(getProperties(vProps->devs[i], props + i));
     struct ncclXmlNode* physNetNode;
@@ -1093,17 +1138,20 @@ ncclResult_t ncclTopoGetVNicParent(struct ncclXml* xml, ncclResult_t (*getProper
   }
 
   int path = PATH_LOC;
+  //计算这些物理网卡节点的共同父节点（parent），以及它们之间的路径类型（path）。
   NCCLCHECK(ncclTopoGetPath(physNetNodes, vProps->ndevs, &path, parent));
-  if (path == PATH_LOC) {
+  if (path == PATH_LOC) {//这表示所有物理网卡的共同父节点就是它们自己（即只有一个节点），此时不需要再为虚拟网卡指定父节点
     *parent = NULL;
   } else if (parent && strcmp((*parent)->name, "pci") == 0) {
+    //如果找到的 parent 节点是 PCI 类型，则需要调用 ncclTopoMakePciParent ，
+    // 为新的虚拟网卡生成一个虚拟的 PCI 父节点（因为多个物理网卡的共同父节点是 PCI，需要人为构造一个 busId 以便插入）
     // If the common parent is PCI, we must reparent the new NIC under a made up busId
     NCCLCHECK(ncclTopoMakePciParent(xml, parent, physNetNodes[0]));
   }
   TRACE(NCCL_GRAPH, "Selected parent %s with path %d", (*parent)->name, path);
   return ncclSuccess;
 }
-
+//根据物理网卡的实际情况和环境变量配置，将物理网卡合并为虚拟网卡，并在拓扑结构中正确插入这些虚拟网卡节点。
 ncclResult_t ncclTopoMakeVNics(ncclComm_t comm, struct ncclXml* xml, ncclResult_t (*makeVDevice)(int*, ncclNetVDeviceProps_t*), ncclResult_t (*getProperties)(int, ncclNetProperties_t*), int physicalDevs) {
   int* placedDevs = NULL;
   struct ncclXmlNode** physNetNodes = NULL;
@@ -1114,6 +1162,7 @@ ncclResult_t ncclTopoMakeVNics(ncclComm_t comm, struct ncclXml* xml, ncclResult_
 
   ncclNetProperties_t* props = NULL;
   ncclCalloc(&props, physicalDevs);
+  //遍历所有物理网卡，获取属性并定位 XML 节点。
   for (int i = 0; i < physicalDevs; i++) {
     NCCLCHECKGOTO(getProperties(i, props + i), res, out);
     struct ncclXmlNode* physNetNode;
@@ -1122,16 +1171,16 @@ ncclResult_t ncclTopoMakeVNics(ncclComm_t comm, struct ncclXml* xml, ncclResult_
     TRACE(NCCL_GRAPH, "Found physical ncclNet node %d %s", i,  props[i].name);
   }
 
-  // By default, don't merge any devices
+  // By default, don't merge any devices. 决定虚拟网卡合并的粒度（如端口级、设备级等），可通过环境变量覆盖
   int mergeLevel;
   mergeLevel = PATH_PORT;
   char* mergeLevelEnv;
   mergeLevelEnv = getenv("NCCL_NET_MERGE_LEVEL");
   if (mergeLevelEnv) kvConvertToInt(mergeLevelEnv, &mergeLevel, nicPathKvList);
   char* forceMerge;
-  forceMerge = getenv("NCCL_NET_FORCE_MERGE");
+  forceMerge = getenv("NCCL_NET_FORCE_MERGE");//如果设置了该环境变量，则强制按照指定方式合并
   NCCLCHECK(ncclCalloc(&placedDevs, physicalDevs));
-  memset(placedDevs, 0, sizeof(int)*physicalDevs);
+  memset(placedDevs, 0, sizeof(int)*physicalDevs);//用于标记哪些物理网卡已经被合并进虚拟网卡，防止重复处理
 
   if (forceMerge) {
     NCCLCHECKGOTO(ncclTopoForceMerge(comm, xml, forceMerge, placedDevs, props, physNetNodes, physicalDevs, makeVDevice), res, out);
@@ -1144,27 +1193,39 @@ out:
   if (placedDevs) free(placedDevs);
   return res;
 }
-
+/*
+根据网卡属性，填充或更新 NCCL 拓扑 XML 中的 net 节点，并设置其 keep、coll 等属性，决定该节点是否参与后续通信。
+- keep=1 ：表示该网卡节点需要被保留，后续拓扑构建、调度等都会考虑它。
+- keep=0 ：表示该网卡节点可以被忽略或删除，不参与后续的通信拓扑。
+*/
 static ncclResult_t ncclTopoPopulateNics(ncclComm_t comm, ncclXml* xml, int startIndex, int endIndex, ncclResult_t (*getProperties)(int, ncclNetProperties_t*), const char* netName, int coll, int keep, int virtualNics) {
   for (int n = startIndex; n < endIndex; n++) {
     ncclNetProperties_t props;
-    NCCLCHECK(getProperties(n, &props));
+    NCCLCHECK(getProperties(n, &props));//第 n 个网卡的属性，填充到 props 结构体。
     struct ncclXmlNode* netNode = NULL;
     struct ncclXmlNode* parent = NULL;
     if (virtualNics) {
+      //如果是虚拟网卡（ virtualNics 为真），尝试查找 XML 中是否已有对应节点，如果没有则查找其父节点。
       struct ncclXmlNode* net = NULL;
       NCCLCHECK(xmlFindTagKv(xml, "net", &net, "name", props.name));
       // In the event of multithreaded use case, we need to re-discover the shared parent of the given devices for this vNIC
-      // Only run this if the net doesn't exist locally - this may alter the XML state
+      // Only run this if the net doesn't exist locally - this may alter the XML state 在多线程场景下，需要重新发现该 vNIC 设备的共享父节点
+      // 这是因为在多线程环境下，多个线程可能会同时操作 XML 拓扑结构，导致某些 net 节点还未被创建或已被修改。此时需要重新查找或创建合适的父节点，确保拓扑结构的正确性和一致性。
+      // 虚拟网卡（vNIC）本身并不是独立存在于硬件中的设备，它们通常是基于某个物理网卡（NIC）或PCI设备虚拟出来的。为了让整个系统的拓扑结构保持一致性和可用性，
+      // 必须把这些vNIC正确地“挂载”到它们所属的物理父节点（如物理NIC、PCIe桥、CPU等）下。这样才能反映出它们和物理设备之间的真实关系。
       if (net == NULL) NCCLCHECK(ncclTopoGetVNicParent(xml, getProperties, &props.vProps, &parent));
     }
-
+    //用于在 XML 拓扑中找到或创建对应的 net 节点，并且挂载到合适的父节点下（大概是CPU->PCI->NIC->Net）
     NCCLCHECK(ncclTopoFillNet(xml, props.pciPath, props.name, &netNode, parent));
 
     const char* colAttr;
-    NCCLCHECK(xmlGetAttr(netNode, "coll", &colAttr));
+    NCCLCHECK(xmlGetAttr(netNode, "coll", &colAttr));//coll 属性获取
 
-    // If coll == 0 but the netNode is tagged as coll, don't update the keep value
+    // If coll == 0 but the netNode is tagged as coll, don't update the keep value.
+    // 这句的意思是：如果 netNode 没有 coll 属性，或者 coll 不是0，或者 collAttr不是"1"，就设置 keep 属性。这样可以避免在某些特殊情况下覆盖 keep 的值。
+    // 这句代码的作用就是 保护 collective NIC 的 keep 属性不被普通 NIC 覆盖 ，确保拓扑中 collective NIC 的特殊属性不会被误改。
+    //keep 属性一般用于标记该网卡节点在后续拓扑优化、裁剪、筛选等流程中是否应该被保留。如果 collective NIC 的 keep 属性被普通 NIC 的逻辑覆盖，可能导致本应保留的高性能网卡被错误地移除或忽略。
+    // 因为函数参数的keep是应用于所有网卡的，但是对于高性能网卡，我们希望保留他的keep属性。
     if (colAttr == NULL || coll != 0 || strcmp(colAttr,"1") != 0) NCCLCHECK(xmlSetAttrInt(netNode, "keep", keep));
     NCCLCHECK(xmlSetAttrInt(netNode, "dev", n));
     NCCLCHECK(xmlInitAttrInt(netNode, "latency", props.latency));
@@ -1172,6 +1233,7 @@ static ncclResult_t ncclTopoPopulateNics(ncclComm_t comm, ncclXml* xml, int star
     NCCLCHECK(xmlInitAttrInt(netNode, "port", props.port));
     NCCLCHECK(xmlInitAttrUint64(netNode, "guid", props.guid));
     NCCLCHECK(xmlInitAttrInt(netNode, "maxconn", props.maxComms));
+    // 判断该网卡是否支持 GPU Direct RDMA（GDR
     bool gdrSupport = (props.ptrSupport & NCCL_PTR_CUDA) || (comm->dmaBufSupport && (props.ptrSupport & NCCL_PTR_DMABUF));
     INFO(NCCL_NET,"NET/%s : GPU Direct RDMA %s for HCA %d '%s'", netName, gdrSupport ? "Enabled" : "Disabled", n, props.name);
     NCCLCHECK(xmlInitAttrInt(netNode, "gdr", gdrSupport));
@@ -1189,28 +1251,35 @@ static ncclResult_t ncclTopoPopulateNics(ncclComm_t comm, ncclXml* xml, int star
 }
 
 struct ncclTopoNetState {
-  int nVirtualNics;
-  int nPhysicalNics;
-  const char* name;
+  int nVirtualNics; // 虚拟网卡数量（如 SR-IOV 场景下的虚拟 NIC 数）
+  int nPhysicalNics;// 物理网卡数量
+  const char* name; // 网络插件的名称（如 "IB", "RoCE", "TCP" 等）
 };
 
 // Calls to network plugin APIs should be protected. This function should be called inside a per-process lock.
+//此函数应在进程级别的锁保护下调用，防止多线程并发访问网络插件 API 导致竞态。
+//用于处理 NCCL 拓扑中的网络插件（如 IB、RoCE、TCP 等），负责枚举物理/虚拟网卡，并将其信息填充到 NCCL 拓扑结构中。
 static ncclResult_t ncclTopoProcessNet(ncclComm_t comm, ncclXml* xml, int coll, const char* dumpXmlFile, ncclTopoNetState* state, ncclResult_t (*getProperties)(int, ncclNetProperties_t*), ncclResult_t (*makeVDevice)(int*, ncclNetVDeviceProps_t*), ncclResult_t (*devices)(int*), const char* netName) {
+  //如果需要导出 XML 文件，或者没有虚拟网卡创建函数，则只使用物理网卡。
+  //导出 XML 文件的目的是记录和反映当前系统的真实硬件拓扑结构，包括物理存在的 CPU、GPU、NIC（网卡）等设备，以及它们之间的连接关系。
+  // 虚拟网卡（如 SR-IOV、软件模拟的 vNIC）是软件层面动态生成的，属于运行时优化或资源复用的产物，并不反映真实的硬件结构。
   int usePhysicalDevices = (dumpXmlFile || makeVDevice == NULL);
-  if (state->nPhysicalNics == -1) NCCLCHECK(devices(&state->nPhysicalNics));
-  // Enumerate physical devices
+  if (state->nPhysicalNics == -1) NCCLCHECK(devices(&state->nPhysicalNics));//获取物理网卡数量
+  // Enumerate physical devices 遍历所有物理网卡，将其属性填充到 NCCL 拓扑结构中。注意这里设置了vnic为0，表示先不处理（因为要先获取所有物理网卡的信息，添加到xml中后才会后续填补vnic的细节。）
   NCCLCHECK(ncclTopoPopulateNics(comm, xml, 0, state->nPhysicalNics, getProperties, netName, coll, 1, 0));
-  if (!usePhysicalDevices) {
+  if (!usePhysicalDevices) {//如果允许使用虚拟网卡
     if (state->nVirtualNics == -1) {
+      //创建虚拟网卡
       NCCLCHECK(ncclTopoMakeVNics(comm, xml, makeVDevice, getProperties, state->nPhysicalNics));
       int nDevs;
       NCCLCHECK(devices(&nDevs));
-      state->nVirtualNics = nDevs - state->nPhysicalNics;
+      state->nVirtualNics = nDevs - state->nPhysicalNics;//虚拟网卡数 = 总数 - 物理网卡数。
     }
     // Remove keep=1 for physical collnets
     if (state->nVirtualNics > 0) {
+      //先移除物理 collnet 的 keep 标记（ keep=1 ），即物理网卡不再作为 collnet 设备。
       NCCLCHECK(ncclTopoPopulateNics(comm, xml, 0, state->nPhysicalNics, getProperties, netName, coll, 0, 0));
-      // Populate new devices
+      // Populate new devices 然后枚举并填充所有虚拟网卡到拓扑结构中。
       NCCLCHECK(ncclTopoPopulateNics(comm, xml, state->nPhysicalNics, state->nPhysicalNics+state->nVirtualNics, getProperties, netName, coll, 1, 1));
     }
   }
@@ -1219,12 +1288,14 @@ static ncclResult_t ncclTopoProcessNet(ncclComm_t comm, ncclXml* xml, int coll, 
 }
 
 static pthread_mutex_t netLock = PTHREAD_MUTEX_INITIALIZER;
+//共享的网络状态数组，用于存储每个网络插件的状态信息。
 ncclTopoNetState netStates[NCCL_NET_MAX_PLUGINS] = {};
 ncclTopoNetState collNetStates[NCCL_NET_MAX_PLUGINS] = {};
+//为指定名字的网络插件（如 IB、RoCE、TCP 等）在全局状态数组中分配或查找一个共享状态槽，并返回其指针。
 ncclResult_t ncclTopoGetSharedState(ncclTopoNetState** state, const char* name, ncclTopoNetState* states) {
   INFO(NCCL_GRAPH, "Retrieving state for %s", name);
   for (int i = 0; i < NCCL_NET_MAX_PLUGINS; i++) {
-    // Empty slot
+    // Empty slot 如果当前槽位还没有被占用（即还没有分配给任何插件），就初始化它：
     if (states[i].name == NULL) {
       states[i].nVirtualNics = -1;
       states[i].nPhysicalNics = -1;
@@ -1241,7 +1312,7 @@ ncclResult_t ncclTopoGetSharedState(ncclTopoNetState** state, const char* name, 
   WARN("NET/TOPO : Couldn't find net with name %s", name);
   return ncclInternalError;
 }
-
+//根据 NCCL 通信器 comm ，构建当前节点的完整拓扑系统结构 system ，并支持 XML 拓扑导入、自动检测、融合、导出等功能。
 ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system, const char* dumpXmlFile) {
   ncclResult_t ret = ncclSuccess;
   struct ncclXml* xml;
@@ -1251,63 +1322,102 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
   int localRank = -1, nLocalRanks = 0;
   int netLockHeld = 0;
   NCCLCHECK(xmlAlloc(&xml, NCCL_TOPO_XML_MAX_NODES));
-  const char* xmlTopoFile = ncclGetEnv("NCCL_TOPO_FILE");
+  const char* xmlTopoFile = ncclGetEnv("NCCL_TOPO_FILE");//优先从环境变量 NCCL_TOPO_FILE 指定的文件加载 XML 拓扑。
   if (xmlTopoFile) {
     INFO(NCCL_ENV, "NCCL_TOPO_FILE set by environment to %s", xmlTopoFile);
     NCCLCHECKGOTO(ncclTopoGetXmlFromFile(xmlTopoFile, xml, 1), ret, fail);
   } else {
-    // Try default XML topology location
+    // Try default XML topology location 尝试加载默认路径
     NCCLCHECKGOTO(ncclTopoGetXmlFromFile("/var/run/nvidia-topologyd/virtualTopology.xml", xml, 0), ret, fail);
   }
   if (xml->maxIndex == 0) {
-    // Create top tag
+    // Create top tag 如果 XML 还没有任何节点，则新建一个名为 system 的根节点，并设置版本号。
     struct ncclXmlNode* top;
     NCCLCHECKGOTO(xmlAddNode(xml, NULL, "system", &top), ret, fail);
     NCCLCHECKGOTO(xmlSetAttrInt(top, "version", NCCL_TOPO_XML_VERSION), ret, fail);
   }
-
+  //刷新 PCIe 交换机的 P2P 拓扑信息（如有需要）。
   NCCLCHECKGOTO(ncclTopoRefreshBcmP2pLinks(), ret, fail);
 
   // Detect only the GPU managed by this process.  We'll get any others through XML fusion.
-  char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
+  //检测本进程管理的 GPU 并标记。其他的GPU信息可以通过XML融合获得。
+  char busId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];//busId在分配comm内存的时候就已经获得了
+  //注意这里的busId不是GPU的busId，而是这个槽的信息。与具体挂载的设备无关
+  //PCI 节点（busId）是插槽/端口的抽象，具体设备信息（如 GPU）是其子节点或附加属性
   NCCLCHECKGOTO(int64ToBusId(comm->peerInfo[comm->rank].busId, busId), ret, fail);
   struct ncclXmlNode* node;
-  NCCLCHECKGOTO(ncclTopoFillGpu(xml, busId, &node), ret, fail);
+  NCCLCHECKGOTO(ncclTopoFillGpu(xml, busId, &node), ret, fail);//将本rank的gpu信息填入到xml中,即在后续的 XML 拓扑精简（如 ncclTopoTrimXml ）过程中，这个节点及其相关分支不会被删除。
   if (node) {
-    NCCLCHECKGOTO(xmlSetAttrInt(node, "keep", 1), ret, fail);
+    NCCLCHECKGOTO(xmlSetAttrInt(node, "keep", 1), ret, fail);//标记当前节点（本进程管理的 GPU 节点）为“需要保留”
     NCCLCHECKGOTO(xmlSetAttrInt(node, "rank", comm->rank), ret, fail);
     NCCLCHECKGOTO(xmlInitAttrInt(node, "gdr", comm->peerInfo[comm->rank].gdrSupport), ret, fail);
   }
 
   // Auto-detect NICs if needed. net/collnet share the same xml/graph nodes,
   // so we start with collnet so that it has precedence.
+  //加锁，保证后续网络拓扑的检测和导入过程是线程安全的，防止多线程同时修改网络相关结构。
+  //只有网络插件相关的拓扑导入需要全局加锁，是因为它们涉及全局共享状态和资源，其他部分则不需要。
+  /*
+  NCCL 支持多种网络插件（如 IB、RoCE、CollNet 等），这些插件的初始化、状态（如 netStates 、 collNetStates ）和拓扑信息是全局共享的。
+  如果多个线程同时导入或修改这些状态，可能会导致竞态条件、内存泄漏或数据不一致。
+  NCCL 的 PCI/CPU/GPU 拓扑结构一般在每个进程内部独立构建，不涉及全局共享状态，因此不需要加锁。
+
+  比如在一台机器上有多块网卡（NIC），NCCL 需要确保所有进程看到的网络设备列表是一致的，不能每个线程/进程各自枚举一遍，
+  否则会导致设备编号、属性等不一致，影响通信拓扑的正确性。
+  */
   pthread_mutex_lock(&netLock);
+  //标记当前线程已经持有网络相关的互斥锁。
   netLockHeld = 1;
   INFO(NCCL_GRAPH, "TOPO/NET : Importing network plugins to topology");
   ncclTopoNetState* state;
   state = NULL;
-  if (collNetSupport(comm)) {
+  if (collNetSupport(comm)) {//支持CollNet
+    //获取 CollNet 插件的共享状态。例如IB、RoCE等。
     NCCLCHECKGOTO(ncclTopoGetSharedState(&state, comm->ncclCollNet->name, collNetStates), ret, fail);
+    // 处理 CollNet 网络，将其信息导入到 NCCL 拓扑结构中。参数 1 表示是 CollNet。
     NCCLCHECKGOTO(ncclTopoProcessNet(comm, xml, 1, dumpXmlFile, state,
       comm->ncclCollNet->getProperties, comm->ncclCollNet->makeVDevice, comm->ncclCollNet->devices, comm->ncclCollNet->name), ret, fail);
   }
+  //获取并处理网络相关的共享状态（如多网卡、虚拟网卡等）。
   NCCLCHECKGOTO(ncclTopoGetSharedState(&state, comm->ncclNet->name, netStates), ret, fail);
+  //负责根据网络属性、设备信息等，处理 XML 拓扑结构，生成合适的网络节点
   NCCLCHECKGOTO(ncclTopoProcessNet(comm, xml, 0, dumpXmlFile, state,
     comm->ncclNet->getProperties, comm->ncclNet->makeVDevice, comm->ncclNet->devices, comm->ncclNet->name), ret, fail);
   pthread_mutex_unlock(&netLock);
   netLockHeld = 0;
 
   // Remove XML branches which don't have a node with keep="1" (typically when importing a topology)
+  // 移除 XML 中没有 keep="1" 标记的分支（通常是导入拓扑时的冗余节点），保证后续处理的 XML 拓扑干净、有效。
   NCCLCHECKGOTO(ncclTopoTrimXml(xml), ret, fail);
 
-  // XML topo fusion.
+  // XML topo fusion. 
+
+  /*
+关于融合：
+NCCL 的主要优化目标是节点内的 GPU 通信（如 NVLink、PCIe），而节点间通信受限于网络瓶颈，优化空间有限。只融合节点内 XML 能满足绝大多数高性能通信需求。
+集群中每个节点（主机）之间通过网络（如 InfiniBand、Ethernet）连接，而节点内的 GPU/CPU/PCIe/NVLink 拓扑才是真正需要详细建模和优化的部分。
+节点间的网络连接通常被抽象为“NET”节点，带宽、延迟等参数远低于节点内互联，且网络结构复杂多变，难以用统一的 XML 拓扑描述。
+如果把整个集群的 XML 融合在一起，随着节点数增加，XML 文件会变得极其庞大，解析、同步和维护都非常低效。而节点内 XML 只需描述本机的硬件结构，体积小、处理快，易于并行化。
+
+  - 判断当前是否为 MNNVL（多节点 NVLink ）模式。
+    - 如果是，直接用 clique 信息（clique 是一组互联的 GPU）。
+    - 如果不是，遍历所有 rank，找出和本地 rank 在同一主机（hostHash 相同）的 rank，构建 localRanks 数组。
+
+  这样后续可以针对 clique 内的所有进程进行拓扑融合、通信优化等操作。
+  */
   if (comm->MNNVL) {
     // MNNVL clique support
-    nLocalRanks = comm->clique.size;
-    localRank = comm->cliqueRank;
-    localRanks = comm->clique.ranks;
+    nLocalRanks = comm->clique.size;//这表示本地“clique”（团，完全互联子集）的进程（rank）数量
+    localRank = comm->cliqueRank;//这是当前进程（rank）在 clique 内的编号（索引）
+    localRanks = comm->clique.ranks;//这是一个数组，包含了所有属于同一个 clique 的 rank (全局的)编号。
   } else {
     // Intra-node fusion.  Much of the comm is not initialized yet at this point so we need to do our own calculations.
+    //在节点内做拓扑融合时，由于 NCCL 的通信结构体还没准备好，所以需要手动计算哪些 rank 属于本地节点，不能直接用 comm 里的现成数据。
+    //虽然 bootstrap（如 bootstrapAllGather、bootstrapIntraNodeAllGather 等）已经完成了进程间的基本通信能力建立，
+    // 但 NCCL 的 comm 结构体（尤其是其中的 localRanks、localRank、clique 等成员）并不是在 bootstrap 完成后立刻全部填充好的。
+    //bootstrap 只负责进程间通信能力的建立,comm 结构体的部分成员需要依赖后续的拓扑融合.只有等到所有本地 rank 的 XML 拓扑都融合完毕，
+    // 才能最终确定哪些 rank 属于本地节点、它们的编号等信息，然后再填充到 comm 里。
+    // 如果不是，遍历所有 rank，找出和本地 rank 在同一主机（hostHash 相同）的 rank，构建 localRanks 数组。
     NCCLCHECKGOTO(ncclCalloc(&localRanks, comm->nRanks), ret, fail);
     for (int i = 0; i < comm->nRanks; i++) {
       if (comm->peerInfo[i].hostHash == comm->peerInfo[comm->rank].hostHash) {
@@ -1317,34 +1427,42 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
       }
     }
   }
+  // 为每个本地 rank 分配一份 XML 拓扑内存。
   NCCLCHECKGOTO(ncclCalloc(&mem, nLocalRanks * xmlMemSize(NCCL_TOPO_XML_MAX_NODES)), ret, fail);
+  // 将本地 XML 拓扑复制到对应的内存区域，并做一次转换（如指针修正等）。
   rankXml = (struct ncclXml*)(mem+xmlMemSize(NCCL_TOPO_XML_MAX_NODES)*localRank);
   memcpy(rankXml, xml, xmlMemSize(NCCL_TOPO_XML_MAX_NODES));
+  //对 NCCL 内部用于描述硬件拓扑的 XML 结构体中的指针进行“指针序列化/反序列化”操作。把每个节点的 parent 和 subs （子节点）指针，转换为“偏移量”或“恢复为指针
   NCCLCHECKGOTO(ncclTopoConvertXml(rankXml, (uintptr_t)xml->nodes, 1), ret, fail);
   // nLocalRanks can't actually be 0, or we wouldn't be running at all...
   // coverity[divide_by_zero]
+  // 通过 bootstrapIntraNodeAllGather，把所有本地 rank 的 XML 拓扑信息同步到每个进程（rank）本地，实现“全员可见”。
   NCCLCHECKGOTO(bootstrapIntraNodeAllGather(comm->bootstrap, localRanks, localRank, nLocalRanks, mem, xmlMemSize(NCCL_TOPO_XML_MAX_NODES)), ret, fail);
   if (comm->MNNVL) {
     // Ensure that we have enough room when fusing topos from multiple nodes.
+    // 如果是多节点 NVLink 融合，需要为融合后的大 XML 分配更大空间。
     free(xml);
     xml = NULL;
     NCCLCHECKGOTO(xmlAlloc(&xml, nLocalRanks*NCCL_TOPO_XML_MAX_NODES), ret, fail);
   } else {
     // In the intra-node case there's no need to enlarge the topo xml.
+    //单节点场景则不需要扩容。只是重置一下节点数量（复用之前的xml结构体）。
     xml->maxIndex = 0;
   }
   for (int i = 0; i < nLocalRanks; i++) {
+    //遍历所有本地 rank 的 XML 拓扑，依次融合到主 XML 结构中。
     struct ncclXml* peerXml = (struct ncclXml*)(mem+xmlMemSize(NCCL_TOPO_XML_MAX_NODES)*i);
-    NCCLCHECKGOTO(ncclTopoConvertXml(peerXml, (uintptr_t)peerXml->nodes, 0), ret, fail);
-    NCCLCHECKGOTO(ncclTopoFuseXml(xml, peerXml), ret, fail);
+    NCCLCHECKGOTO(ncclTopoConvertXml(peerXml, (uintptr_t)peerXml->nodes, 0), ret, fail);//反序列化。
+    NCCLCHECKGOTO(ncclTopoFuseXml(xml, peerXml), ret, fail);//把 peerXml 的节点合并进 xml。
   }
-
+  // 如果设置了环境变量要求导出 XML 拓扑，并且当前 rank 是指定的导出 rank，则将融合后的 XML 拓扑写入文件。
   if (dumpXmlFile && comm->rank == ncclParamTopoDumpFileRank()) {
     INFO(NCCL_ENV, "NCCL_TOPO_DUMP_FILE set by environment to %s", dumpXmlFile);
     NCCLCHECKGOTO(ncclTopoDumpXmlToFile(dumpXmlFile, xml), ret, fail);
   }
 
   // Only update our topo tracking structure if we aren't dumping (separate steps)
+  // 如果不是仅仅导出 XML 文件，则根据融合后的 XML 拓扑，生成最终的 NCCL 拓扑系统结构体（system）。
   if (dumpXmlFile == NULL) NCCLCHECKGOTO(ncclTopoGetSystemFromXml(xml, system, comm->peerInfo[comm->rank].hostHash), ret, fail);
 
 exit:

@@ -577,11 +577,14 @@ ncclResult_t ncclTopoGetPxnRanks(struct ncclComm* comm, int** intermediateRanks,
   *intermediateRanks = ranks;
   return ncclSuccess;
 }
-
+/*
+负责 预计算 NCCL 拓扑结构中所有 GPU、CPU、NIC（网卡）、NVSwitch 之间的最优通信路径 ，为后续通信调度和优化提供基础数据。
+它会根据硬件连接、P2P 能力、GDR 能力等，自动调整路径，确保数据传输高效且可达。
+*/
 ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm* comm) {
   // Precompute paths between GPUs/NICs.
 
-  // Remove everything in case we're re-computing
+  // Remove everything in case we're re-computing 先清空所有节点的路径信息，防止重复计算或脏数据。
   ncclTopoRemovePaths(system);
 
   // Set direct paths to CPUs. We need them in many cases.

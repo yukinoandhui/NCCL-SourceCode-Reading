@@ -47,7 +47,7 @@ ncclResult_t busIdToInt64(const char* busId, int64_t* id) {
 ncclResult_t getBusId(int cudaDev, int64_t *busId) {
   // On most systems, the PCI bus ID comes back as in the 0000:00:00.0
   // format. Still need to allocate proper space in case PCI domain goes
-  // higher.
+  // higher. 预留了扩展空间（防止 domain 超过 0000）
   char busIdStr[] = "00000000:00:00.0";
   CUDACHECK(cudaDeviceGetPCIBusId(busIdStr, sizeof(busIdStr), cudaDev));
   NCCLCHECK(busIdToInt64(busIdStr, busId));
