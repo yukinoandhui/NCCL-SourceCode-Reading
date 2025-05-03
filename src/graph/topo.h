@@ -74,7 +74,7 @@ extern const char* topoLinkTypeStr[];//连接类型字符串数组声明。
 
 // Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU) 经过PCIe主桥（通常是CPU）的路径类型编号
 #define PATH_PHB 6
-
+//PATH_SYS 一般只在路径跨越了整个系统（比如多路物理 CPU、跨主板等）时才会用到。
 // Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI) 经过PCIe和SMP互连（如QPI/UPI）的路径类型编号
 #define PATH_SYS 7
 

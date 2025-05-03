@@ -46,6 +46,7 @@ NCCL_PARAM(NvbDisable, "NVB_DISABLE", 0);
 - 带宽最大优先 ：在跳数相同的情况下，选择带宽更大的路径。
 - 路径类型优先 ：路径类型（如 NVLink、PCIe、Host Bridge 等）也会影响优先级，通常 NVLink > PCIe > Host Bridge。
 - 避免环路和重复 ：每个节点只在更优条件下才会被加入下一轮 BFS 队列，避免重复遍历。
+spfa算法
 */
 static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclTopoSystem* system) {
     // 如果还没有为 baseNode 分配 paths 数组，则分配并初始化为 PATH_DIS（不可达）
@@ -71,8 +72,8 @@ static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclT
     nextNodeList.count = 0;
     for (int n=0; n<nodeList.count; n++) {
       struct ncclTopoNode* node = nodeList.list[n];
-      struct ncclTopoLinkList* path;
-      //获取当前节点到原点的路径。
+      struct ncclTopoLinkList* path;//获取当前节点到原点的路径。
+      
       NCCLCHECK(getPath(system, node, baseNode->type, baseNode->id, &path));
       //遍历所有的边
       for (int l=0; l<node->nlinks; l++) {
@@ -95,9 +96,21 @@ static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclT
         if (node != baseNode && node->type == GPU &&
             (ncclParamNvbDisable() || link->type != LINK_NVL || remNode->type != GPU || path->count > 1)) continue;
         // 如果 remPath 尚未设置，或当前路径更短且带宽更大，则更新 remPath
+        //虽然 BFS 保证了第一次访问到的路径是最短的，但由于 NCCL 拓扑的特殊性（多链路、多类型），同一节点可能被多次访问。
+        /*
+        例如：
+          - GPU0 通过 NVLink 访问 GPU1（跳数1，带宽高），这是第一次访问，记录下来。
+          - 后续 BFS 过程中，GPU0 还可能通过 PCIe 间接访问 GPU1（跳数2，带宽低），这时虽然节点还是 GPU1，但路径不同。
+          没有全局 visited 标记，是为了允许同一节点在不同条件下多次入队和路径比较，最终只保留最优路径。
+          代码通过遍历 nextNodeList 实现了“本轮不重复入队”。
+        */
         if ((remPath->bw == 0 || remPath->count > path->count) && remPath->bw < bw) {
           // Find reverse link
           for (int l=0; l<remNode->nlinks; l++) {
+            //在 remNode（当前遍历到的节点）所有的出边（links）中，找到一条“指向 node 且类型与 link 相同”的边。
+            //如果找到这样一条边，就把它的指针赋值给 remPath->list[0] ，表示 remPath 路径的第一跳就是这条反向边。
+            // 如果直接用 node->links[l]，那这个指针是“从 node 出发到 remNode”的， 但我们现在要构建的是“从 remNode 出发到 baseNode”的路径， 
+            // 所以 第一跳必须是 remNode 出发的链路指针 ，即 remNode->links[x]。因为虽然本质上是一样的边，但是在内存中是不同的两个指针。
             if (remNode->links[l].remNode == node && remNode->links[l].type == link->type) {
               remPath->list[0] = remNode->links+l;
               break;
@@ -116,10 +129,14 @@ static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclT
 // 路径类型推断
           // Start with path type = link type. PATH and LINK types are supposed to match.
           // Don't consider LINK_NET as we only care about the NIC->GPU path.
+          // NCCL 在路径类型推断时，实际上只关心 GPU/NIC 之间的本地路径（比如 GPU 到 NIC 的直连），而不关心网络链路本身的类型。
+          // 
           int type = link->type == LINK_NET ? LINK_LOC : link->type;
           // Differentiate between one and multiple PCI switches
           if (node->type == PCI && remNode->type == PCI) type = PATH_PXB; // 多级 PCIe Switch
           // Consider a path going through the CPU as PATH_PHB
+          // NCCL 主要关注 GPU/NIC 之间的通信优化，CPU <-> CPU 的路径在实际通信中很少直接用到，所以这里做了简化处理
+          // 即使 CPU <-> CPU 被归为 PATH_PHB，实际带宽/延迟建模和调度时影响不大，因为 NCCL 主要不会让数据在 CPU 之间直接流动。
           if (link->type == LINK_PCI && (node->type == CPU || link->remNode->type == CPU)) type = PATH_PHB; // 经过 CPU Host Bridge
           // Set 1 hop NVLink as NVB
           if (node->type == GPU && path->type == PATH_NVL && type == PATH_NVL && remPath->count > 1) type = PATH_NVB; // 多跳 NVLink
