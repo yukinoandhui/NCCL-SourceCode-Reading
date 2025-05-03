@@ -18,10 +18,12 @@ static int hexToInt(char c) {
 }
 
 #define CPU_SET_N_U32 (sizeof(cpu_set_t)/sizeof(uint32_t))
-
+//将形如 "0003ff,f0003fff" 的十六进制字符串转换为 cpu_set_t 掩码结构
+//- 0003ff ：低32位掩码，表示第0~9号CPU核可用（0x3ff = 0000 0011 1111 1111）
+// 字符串中， 高位的掩码段写在后面 ，低位的掩码段写在前面
 static ncclResult_t ncclStrToCpuset(const char* str, cpu_set_t* mask) {
   uint32_t cpumasks[CPU_SET_N_U32];
-  int m = CPU_SET_N_U32-1;
+  int m = CPU_SET_N_U32-1;//字符串中， 高位的掩码段写在后面 ，低位的掩码段写在前面。所以这里倒着遍历。
   cpumasks[m] = 0;
   for (int o=0; o<strlen(str); o++) {
     char c = str[o];
@@ -29,9 +31,10 @@ static ncclResult_t ncclStrToCpuset(const char* str, cpu_set_t* mask) {
       m--;
       cpumasks[m] = 0;
     } else {
+      //每个字符转为16进制数（0-15），左移4位并累加到当前段。
       int v = hexToInt(c);
       if (v == -1) break;
-      cpumasks[m] <<= 4;
+      cpumasks[m] <<= 4;//每个十六进制字符代表4个二进制位（bits）。
       cpumasks[m] += v;
     }
   }

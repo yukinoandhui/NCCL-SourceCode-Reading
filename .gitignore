@@ -2,3 +2,6 @@
 /build
 *.gcov
 /coverage/
+/.vscode
+compile_commands.json
+/.cache

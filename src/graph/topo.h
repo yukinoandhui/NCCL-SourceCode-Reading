@@ -10,7 +10,7 @@
 #include "graph.h"
 #include "core.h"
 //GB/s
-#define LOC_BW 5000.0 // Local bandwidth  本地带宽（GB/s），用于本地通信建模。
+#define LOC_BW 5000.0 // Local bandwidth  本地带宽（GB/s），用于本地通信建模。 这里的值估计都不是准确的，大小只是表示一种相对顺序，本地的最快
 #define SM60_NVLINK_BW 18.0
 #define SM70_NVLINK_BW 20.0
 #define SM80_NVLINK_BW 20.0
@@ -99,7 +99,7 @@ struct ncclTopoLink { //拓扑连接结构体，包含类型、带宽、远端�
 // Allows for up to 32 NICs per node on GB200-NVL72
 #define NCCL_TOPO_MAX_LINKS 576 //每个节点最大连接数576（支持多NIC）
 #define NCCL_TOPO_MAX_HOPS (NCCL_TOPO_MAX_NODES*NCCL_TOPO_NODE_TYPES)//最大跳数=最大节点数*节点类型数。一个GPU节点，可能需要到所有NIC、所有CPU、所有PCI等类型节点建立通信路径。（每个都有256个）
-
+//这里linklist其实才是一条路径，那么多个linklist就是多条路径
 struct ncclTopoLinkList {
   struct ncclTopoLink* list[NCCL_TOPO_MAX_HOPS];//按顺序记录了一条路径上的边
   int count;//表示这条路径上总共经过了多少跳（即多少条边）。
@@ -130,29 +130,30 @@ struct ncclTopoNode {
       int gdrSupport;
     }gpu;
     struct {
-      int dev; // Plugin dev number
-      uint64_t asic;
-      int port;
-      float bw;
-      float latency;
+      int dev; // Plugin dev number  插件设备编号（网络设备的唯一标识）。
+      uint64_t asic;// 网络设备的ASIC芯片编号（唯一标识）。
+      int port; // 端口号。
+      float bw;// 网络带宽（GB/s）。
+      float latency;// 网络延迟（单位：us或ns，具体看实现）。
       int gdrSupport;
-      int collSupport;
-      int maxChannels;
+      int collSupport;// 是否支持collective offload（集体通信加速）。
+      int maxChannels;// 最大支持的通信通道数。
     }net;
     struct {
-      int arch;
+      int arch; // CPU架构
       int vendor;//CPU 厂商（如 Intel、AMD、兆芯等
       int model;//CPU 的具体型号（如 BDW、SKL、YONGFENG 等）
       cpu_set_t affinity;
     }cpu;
     struct {
-      uint64_t device;
+      uint64_t device; // PCI设备号（用于唯一标识PCI设备）。
     }pci;
   };
   int nlinks; //连接数
   struct ncclTopoLink links[NCCL_TOPO_MAX_LINKS]; //连接数组，相当于节点的边
   // Pre-computed paths to GPUs and NICs 示“本节点到其它类型节点的预计算路径”（是路径，不是直接的边）。当前节点到每一种类型节点的“最优路径”集合
   // 每条路径是由一系列 ncclTopoLink* 组成，描述了从本节点出发，经过哪些边（links），最终到达目标类型节点。
+  // 这里ncclTopoLinkList*其实就是多条路径的集合
   struct ncclTopoLinkList* paths[NCCL_TOPO_NODE_TYPES]; 
   // Used during search
   uint64_t used;

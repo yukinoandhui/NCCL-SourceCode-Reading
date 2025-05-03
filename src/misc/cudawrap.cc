@@ -141,8 +141,9 @@ bool ncclCudaLaunchBlocking = false;
         return ncclSystemError; }                                       \
     } } while(0)
 #else
+//cudaGetDriverEntryPoint动态获取函数指针
 #define LOAD_SYM(symbol, ignore) do {                                   \
-    res = cudaGetDriverEntryPoint(#symbol, (void **) (&pfn_##symbol), cudaEnableDefault); \ //动态获取函数指针
+    res = cudaGetDriverEntryPoint(#symbol, (void **) (&pfn_##symbol), cudaEnableDefault); \ 
     if (res != cudaSuccess) { \
       if (!ignore) {                                                    \
         WARN("Retrieve %s failed with %d", #symbol, res);               \

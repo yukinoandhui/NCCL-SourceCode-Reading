@@ -210,7 +210,7 @@ struct ncclNetSocketListenComm {
 //表示一个完整的通信对象，包含发送或接收数据所需的所有资源
 struct ncclNetSocketComm {
   struct ncclSocket ctrlSock;// 控制套接字，用于传输元数据
-  struct ncclSocket socks[MAX_SOCKETS];/ 数据套接字数组，用于并行传输数据
+  struct ncclSocket socks[MAX_SOCKETS];// 数据套接字数组，用于并行传输数据
   int dev;
   int cudaDev;
   int nSocks; // 实际使用的套接字数量

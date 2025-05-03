@@ -481,7 +481,9 @@ struct ncclComm {
   int nvmlDev; // my nvml device index
   int compCap; // compute capability of the GPU
   int minCompCap, maxCompCap; // min/max compute capability in the communicator
-  int64_t busId;   // my PCI bus ID in int format
+  int64_t busId;   // my PCI bus ID in int format  
+  // 注意区分NCCL里的busId并不是指的总线号，指的其实是定位一个PCIe设备用到的id，即BDF(bus + device + function)，
+  // 一个bus上有多个设备，一个设备有多个功能，因此通过BDF就可以定位一个设备
   cpu_set_t cpuAffinity; // CPU affinity of the GPU
   int cudaArch; // matches __CUDA_ARCH__ of device
 

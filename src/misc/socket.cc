@@ -755,7 +755,7 @@ ncclResult_t ncclSocketAccept(struct ncclSocket* sock, struct ncclSocket* listen
 exit:
   return ret;
 }
-//初始化一个socket
+//初始化一个socket，默认是阻塞的
 ncclResult_t ncclSocketInit(struct ncclSocket* sock, const union ncclSocketAddress* addr, uint64_t magic, enum ncclSocketType type, volatile uint32_t* abortFlag, int asyncFlag, int customRetry) {
   ncclResult_t ret = ncclSuccess;
 

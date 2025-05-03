@@ -19,9 +19,17 @@ struct ncclTopoNodeList {
   struct ncclTopoNode* list[NCCL_TOPO_MAX_NODES];
   int count;
 };
-
+//根据节点类型 t 和节点 id id ，在 topoSystem 中找到目标节点在 node->paths 里的路径指针，并返回给调用者。
+//其实主要就是找到指针，因为我们要知道这个path的指针指向的是谁，而系统中其实已经创建了相关的
+// 这里就是从当前node出发，到id这个节点的路径。
+//这样设计的好处是可以用统一的方式，快速定位和访问任意节点到任意类型、任意编号节点的路径信息，方便路径的查找、更新和管理。
 static ncclResult_t getPath(struct ncclTopoSystem* system, struct ncclTopoNode* node, int t, int64_t id, struct ncclTopoLinkList** path) {
   for (int i=0; i<system->nodes[t].count; i++) {
+    // node->paths[t] 就是一个指向“所有 t 类型节点路径数组”的指针。
+    //i是在系统中类型为 t 的节点的编号（即 system->nodes[t].nodes[i] 就是第 i 个 t 类型节点）。
+    //node->paths[t]+i 就是“从 node 出发，到系统中第 i 个 t 类型节点的路径信息结构体（ncclTopoLinkList）”的指针。
+    //假设 node 是 GPU0，t=NET，i=1，那么 node->paths[NET]+1 就是“从 GPU0 到系统中第 1 个 NET 节点的最优路径信息”的指针。
+
     if (system->nodes[t].nodes[i].id == id) {
       *path = node->paths[t]+i;
       return ncclSuccess;
@@ -32,44 +40,61 @@ static ncclResult_t getPath(struct ncclTopoSystem* system, struct ncclTopoNode* 
 }
 
 NCCL_PARAM(NvbDisable, "NVB_DISABLE", 0);
-
+//该函数以 baseNode 为起点，使用 BFS 算法，递归地为系统中所有同类型节点建立最优路径（带宽最大、跳数最少），并记录路径类型。
+/*
+- 最短跳数优先 ：优先选择跳数更少的路径（即 BFS 的天然特性）。
+- 带宽最大优先 ：在跳数相同的情况下，选择带宽更大的路径。
+- 路径类型优先 ：路径类型（如 NVLink、PCIe、Host Bridge 等）也会影响优先级，通常 NVLink > PCIe > Host Bridge。
+- 避免环路和重复 ：每个节点只在更优条件下才会被加入下一轮 BFS 队列，避免重复遍历。
+*/
 static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclTopoSystem* system) {
+    // 如果还没有为 baseNode 分配 paths 数组，则分配并初始化为 PATH_DIS（不可达）
   if (baseNode->paths[baseNode->type] == NULL) {
+    // 注意这里是同类型节点。
     NCCLCHECK(ncclCalloc(baseNode->paths+baseNode->type, system->nodes[baseNode->type].count));
     for (int i=0; i<system->nodes[baseNode->type].count; i++) baseNode->paths[baseNode->type][i].type = PATH_DIS;
   }
-
+  // 使用 BFS 进行路径搜索
   // breadth-first search to set all paths to that node in the system
   struct ncclTopoNodeList nodeList;
   struct ncclTopoNodeList nextNodeList = { { 0 }, 0 };
   nodeList.count = 1; nodeList.list[0] = baseNode;
-  struct ncclTopoLinkList* basePath;
+  struct ncclTopoLinkList* basePath;// 在这里代表的是“baseNode 到自身的路径信息”，即从 baseNode 出发，回到 baseNode 本身的路径（也就是自环/self-loop）。
+  //NCCL 的路径信息是以二维数组（paths）形式存储的，每个节点到每种类型、每个编号节点的路径都单独有一份结构体
+  // 可以精准地拿到 baseNode 到自身的路径结构体指针，然后对其进行初始化
   NCCLCHECK(getPath(system, baseNode, baseNode->type, baseNode->id, &basePath));
-  basePath->count = 0;
-  basePath->bw = LOC_BW;
-  basePath->type = PATH_LOC;
-
+  basePath->count = 0;// 到自身的路径长度为0
+  basePath->bw = LOC_BW;// 到自身的带宽为本地带宽
+  basePath->type = PATH_LOC;// 路径类型为本地
+  // BFS 主循环
   while (nodeList.count) {
     nextNodeList.count = 0;
     for (int n=0; n<nodeList.count; n++) {
       struct ncclTopoNode* node = nodeList.list[n];
       struct ncclTopoLinkList* path;
+      //获取当前节点到原点的路径。
       NCCLCHECK(getPath(system, node, baseNode->type, baseNode->id, &path));
+      //遍历所有的边
       for (int l=0; l<node->nlinks; l++) {
-        struct ncclTopoLink* link = node->links+l;
-        struct ncclTopoNode* remNode = link->remNode;
+        struct ncclTopoLink* link = node->links+l;//当前连接
+        struct ncclTopoNode* remNode = link->remNode;// 当前连接到的点。
+        // 如果 remNode 还没有分配 paths，则分配并初始化为不可达
         if (remNode->paths[baseNode->type] == NULL) {
           NCCLCHECK(ncclCalloc(remNode->paths+baseNode->type, system->nodes[baseNode->type].count));
           for (int i=0; i<system->nodes[baseNode->type].count; i++) remNode->paths[baseNode->type][i].type = PATH_DIS;
         }
         struct ncclTopoLinkList* remPath;
+        //获取 remNode 到原点的路径。
         NCCLCHECK(getPath(system, remNode, baseNode->type, baseNode->id, &remPath));
-        float bw = std::min(path->bw, link->bw);
+        float bw = std::min(path->bw, link->bw);// 路径带宽取当前路径和新链路的最小值
 
         // allow routing through a GPU only as 1 hop
+        // 只允许通过 GPU 作为 1 跳 NVLink 路由（即只允许 GPU 作为中转节点时，必须是直接通过 NVLink 连接的 GPU，并且不能是多跳路径）。
+        // 简单来说就是只允许直连的gpu路径（前提是这些条件成立）
+        // 从其他节点到某个gpuB中间最多经过一个和gpuB直连的gpuA
         if (node != baseNode && node->type == GPU &&
             (ncclParamNvbDisable() || link->type != LINK_NVL || remNode->type != GPU || path->count > 1)) continue;
-
+        // 如果 remPath 尚未设置，或当前路径更短且带宽更大，则更新 remPath
         if ((remPath->bw == 0 || remPath->count > path->count) && remPath->bw < bw) {
           // Find reverse link
           for (int l=0; l<remNode->nlinks; l++) {
@@ -84,23 +109,25 @@ static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclT
             return ncclInternalError;
           }
           // Copy the rest of the path
+          // 拷贝之前路径上的 link，形成完整路径
           for (int i=0; i<path->count; i++) remPath->list[i+1] = path->list[i];
           remPath->count = path->count + 1;
           remPath->bw = bw;
-
+// 路径类型推断
           // Start with path type = link type. PATH and LINK types are supposed to match.
           // Don't consider LINK_NET as we only care about the NIC->GPU path.
           int type = link->type == LINK_NET ? LINK_LOC : link->type;
           // Differentiate between one and multiple PCI switches
-          if (node->type == PCI && remNode->type == PCI) type = PATH_PXB;
+          if (node->type == PCI && remNode->type == PCI) type = PATH_PXB; // 多级 PCIe Switch
           // Consider a path going through the CPU as PATH_PHB
-          if (link->type == LINK_PCI && (node->type == CPU || link->remNode->type == CPU)) type = PATH_PHB;
+          if (link->type == LINK_PCI && (node->type == CPU || link->remNode->type == CPU)) type = PATH_PHB; // 经过 CPU Host Bridge
           // Set 1 hop NVLink as NVB
-          if (node->type == GPU && path->type == PATH_NVL && type == PATH_NVL && remPath->count > 1) type = PATH_NVB;
+          if (node->type == GPU && path->type == PATH_NVL && type == PATH_NVL && remPath->count > 1) type = PATH_NVB; // 多跳 NVLink
 
           remPath->type = std::max(path->type, type);
 
           // Add to the list for the next iteration if not already in the list
+          // 将 remNode 加入下一轮 BFS 队列（避免重复）
           int i;
           for (i=0; i<nextNodeList.count; i++) if (nextNodeList.list[i] == remNode) break;
           if (i == nextNodeList.count) nextNodeList.list[nextNodeList.count++] = remNode;
@@ -588,25 +615,26 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
   ncclTopoRemovePaths(system);
 
   // Set direct paths to CPUs. We need them in many cases.
+  // 2. 为每个 CPU 节点设置到其它 CPU 节点的直接路径
   for (int c=0; c<system->nodes[CPU].count; c++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[CPU].nodes+c, system));
   }
-
+ // 3. 为每个 GPU 节点设置到其它 GPU 节点的直接路径
   // Set direct paths to GPUs.
   for (int g=0; g<system->nodes[GPU].count; g++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[GPU].nodes+g, system));
   }
-
+// 4. 为每个 NIC 节点设置到其它 NIC 节点的直接路径
   // Set direct paths to NICs.
   for (int n=0; n<system->nodes[NET].count; n++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[NET].nodes+n, system));
   }
-
+// 5. 为每个 NVSwitch 节点设置到其它 NVSwitch 节点的直接路径
   // Set direct paths to NVSwitches.
   for (int n=0; n<system->nodes[NVS].count; n++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[NVS].nodes+n, system));
   }
-
+// 6. 处理 GPU 间 P2P 不可用的情况，将流量绕行 CPU
   // Update path for GPUs when we don't want to / can't use GPU Direct P2P
   for (int g=0; g<system->nodes[GPU].count; g++) {
     for (int p=0; p<system->nodes[GPU].count; p++) {
@@ -615,6 +643,7 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
                                  system->nodes[GPU].nodes[g].gpu.rank, &p2p, NULL, NULL));
       if (p2p == 0) {
         // Divert all traffic through the CPU
+        // 如果 GPU p 到 GPU g 之间 P2P 不可用，则通过本地 CPU 绕行
         int cpu;
         NCCLCHECK(ncclGetLocalCpu(system, g, &cpu));
         NCCLCHECK(addInterStep(system, CPU, cpu, GPU, p, GPU, g));
@@ -622,6 +651,7 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
     }
 
     if (comm == NULL) continue;
+        // 7. 标记完全不可达的 GPU 对（P2P 和 SHM 都不可用），后续会被修剪
     // Remove GPUs we can't (or don't want to) communicate with through P2P or SHM
     struct ncclPeerInfo* dstInfo = comm->peerInfo+system->nodes[GPU].nodes[g].gpu.rank;
     for (int p=0; p<system->nodes[GPU].count; p++) {
@@ -634,6 +664,7 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
         NCCLCHECK(ncclTransports[TRANSPORT_SHM]->canConnect(&shm, comm, NULL, srcInfo, dstInfo));
         if (shm == 0) {
           // Mark this peer as inaccessible. We'll trim it later.
+          // 标记该路径只能通过网络通信
           system->nodes[GPU].nodes[p].paths[GPU][g].type = PATH_NET;
         }
       }
@@ -641,9 +672,10 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
   }
 
   // Update paths for NICs (no GPU Direct, PXN, ...)
+    // 8. 处理 GPU 到 NIC 的路径优化（PXN、GDR等）
   for (int n=0; n<system->nodes[NET].count; n++) {
     struct ncclTopoNode* netNode = system->nodes[NET].nodes+n;
-
+      // 8.1 检查是否可以通过其他 NVLink 连接的 GPU 中转访问 NIC（PXN）
     for (int g=0; g<system->nodes[GPU].count; g++) {
       // Check whether we can access the NIC through another NVLink-connected GPU (PXN)
       struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
@@ -662,9 +694,11 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
           // We can use that GPU as relay to communicate with that NIC.
           // Only enabling it in the GPU->NIC direction for now to favor
           // receiving locally and sending remotely (consistent with net.cc)
+          // 通过 peerNode GPU 中转访问 NIC，优化带宽或避免经过 CPU
           NCCLCHECK(addInterStep(system, GPU, localGpuIndex, GPU, g, NET, n));
         }
       }
+       // 8.2 如果 GPU 到 NIC 路径类型优于 PHB，检查 GDR 能力
       if (gpu->paths[NET][n].type < PATH_PHB) {
         // Update path when we dont want to / can't use GPU Direct RDMA.
         int gdr;

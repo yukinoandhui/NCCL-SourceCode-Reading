@@ -631,6 +631,7 @@ ncclResult_t ncclTopoGetXmlFromSys(struct ncclXmlNode* pciNode, struct ncclXml* 
   //当检测到当前 PCI 设备的 vendor 是 "0x1000"（即 Broadcom BCM PCIe 交换机）时，自动查找并补全该交换机的 P2P（Peer-to-Peer）连接信息。
   //博通的这个交换机可以理解为nvSwitch的pcie版
   //自动补全 PCIe 交换机的 P2P 拓扑信息 ，让 NCCL 能够正确识别和利用 PCIe 交换机下的直连路径，优化 GPU 间通信。
+  // 这种 pcilink 节点的作用是 描述 PCIe 交换机与其他 PCIe 交换机之间的本地互联关系 ，而不是描述 PCIe 交换机与下挂设备（如 GPU、NIC）的连接。
   if (vendor != NULL && strcmp(vendor, "0x1000") == 0) { // BCM switch, look for P2P connections
     int nlinks;
     char* peers;

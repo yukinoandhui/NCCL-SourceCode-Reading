@@ -44,7 +44,7 @@ ncclResult_t pciPathToInt64(char* path, int offset, int minOffset, int64_t* id) 
   *id = numid;
   return ncclSuccess;
 }
-
+//查找连接另一端的cpu节点
 static ncclResult_t findLocalCpu(struct ncclTopoNode* node, struct ncclTopoNode** cpu) {
   *cpu = NULL;
   if (node->type == CPU) {
@@ -104,7 +104,7 @@ ncclResult_t ncclTopoGetNode(struct ncclTopoSystem* system, struct ncclTopoNode*
   }
   return ncclSuccess;
 }
-
+//创建节点添加到拓扑结构中。（简单初始化一下）
 ncclResult_t ncclTopoCreateNode(struct ncclTopoSystem* system, struct ncclTopoNode** node, int type, uint64_t id) {
   if (system->nodes[type].count == NCCL_TOPO_MAX_NODES) {
     WARN("Error : tried to create too many nodes of type %d", type);
@@ -154,26 +154,29 @@ ncclResult_t ncclTopoRemoveNode(struct ncclTopoSystem* system, int type, int ind
   system->nodes[type].count--;
   return ncclSuccess;
 }
-
+// 为拓扑节点 node 添加一条到 remNode 的连接（如 PCI、NVLink、NET 等），并维护连接的带宽信息。
 ncclResult_t ncclTopoConnectNodes(struct ncclTopoNode* node, struct ncclTopoNode* remNode, int type, float bw) {
   // Aggregate links into higher bw for NVLink
   struct ncclTopoLink* link;
+  //代码首先遍历 node->links ，查找是否已经存在指向 remNode 且类型为 type 的连接（如 NVLink、PCI、NET 等）
   for (link = node->links; link - node->links != NCCL_TOPO_MAX_LINKS && link->remNode; link++) {
+    //如果找到了， link 指向该连接；如果没找到， link 会指向第一个空位（ link->remNode == NULL ）。
     if (link->remNode == remNode && link->type == type) break;
   }
+  //如果遍历到的连接数已经达到最大值 NCCL_TOPO_MAX_LINKS ，则报错并返回，防止溢出。
   if (link - node->links == NCCL_TOPO_MAX_LINKS) {
     WARN("Error : too many Topo links (max %d)", NCCL_TOPO_MAX_LINKS);
     return ncclInternalError;
   }
-  if (link->remNode == NULL) node->nlinks++;
+  if (link->remNode == NULL) node->nlinks++;//如果是新建连接（即 link->remNode == NULL ），则将 node->nlinks 计数加一。
   link->type = type;
   link->remNode = remNode;
-  link->bw += bw;
+  link->bw += bw;//如果是多次调用同一对节点和类型，会累加带宽
 
-  // Sort links in BW descending order
+  // Sort links in BW descending order 带宽降序排序
   struct ncclTopoLink linkSave;
   memcpy(&linkSave, link, sizeof(struct ncclTopoLink));
-  while (link != node->links) {
+  while (link != node->links) { //通过插入排序的方式，将新连接插入到合适的位置，保证 node->links 按带宽降序排列。
     if ((link-1)->bw >= linkSave.bw) break;
     memcpy(link, link-1, sizeof(struct ncclTopoLink));
     link--;
@@ -186,41 +189,50 @@ ncclResult_t ncclTopoConnectNodes(struct ncclTopoNode* node, struct ncclTopoNode
 // even though they're supposed to sustain full BW across all ports.
 // Flatten the switch as this extra level can break the search and make
 // NCCL take wrong topology decisions.
+/*
+BCM Gen4 PCIe Switch （如Broadcom PEX）：在实际硬件中，这类交换机有时会被操作系统或固件虚拟成两级（父子）结构，
+但实际上它们的所有端口之间带宽是对等的（全互联），并不存在真正的“父子”带宽瓶颈。
+*/
 int getBcmGen(uint64_t id, int level) {
   if ((id & 0xfffffffffffff000) == 0x1000c0101000a000) return 4;
   if ((id & 0xfffffffffffff000) == (0x1000c03010000000 | level*0x1000)) return 5;
   return 0;
 }
+// 该函数是为了解决BCM Gen4 PCIe交换机虚拟两级结构带来的拓扑建模问题。
+// 通过“扁平化”处理，把所有下挂设备直接挂到父交换机下，移除中间的子交换机节点，使NCCL的拓扑结构更准确、路径搜索更高效。
 ncclResult_t ncclTopoFlattenBcmSwitches(struct ncclTopoSystem* system) {
   ncclResult_t ret = ncclSuccess;
   for (int s=0; s<system->nodes[PCI].count; s++) {
     struct ncclTopoNode* pciSwitch = system->nodes[PCI].nodes+s;
-    int gen = getBcmGen(pciSwitch->pci.device, 0);
+    int gen = getBcmGen(pciSwitch->pci.device, 0); //遍历所有PCI类型节点 ，找到BCM Gen4类型的PCIe交换机（ getBcmGen 判断）
     // Flatten Gen4 PEX switches in base mode
     if (gen) {
-      // Find sub switches with the same device ID.
+      // Find sub switches with the same device ID. 
+      //查找所有子交换机 （即与当前交换机直连、且同为BCM Gen4的PCI节点）。
       int64_t* subSwIds;
       NCCLCHECK(ncclCalloc(&subSwIds, pciSwitch->nlinks));
       int subs = 0;
+      
       for (int l=0; l<pciSwitch->nlinks; l++) {
         struct ncclTopoNode* sub = pciSwitch->links[l].remNode;
         // Only fuse sub switches with the same device ID.
         if (sub->type != PCI || getBcmGen(sub->pci.device, 1) != gen) continue;
         // Save sub switch for later
         subSwIds[subs++] = sub->id;
-        // Remove link to that sub switch
+        // Remove link to that sub switch // 移除父交换机到子交换机的连接
         memmove(pciSwitch->links+l, pciSwitch->links+l+1, (pciSwitch->nlinks-l-1)*(sizeof(struct ncclTopoLink)));
         pciSwitch->nlinks--;
         // Don't increase l for the next iteration as we just shifted all links by one.
         l--;
       }
-
+      // 2. 处理每个子交换机
       for (int s=0; s<subs; s++) {
         // Find sub switch (system->nodes[PCI].nodes is changing every time we remove a node)
-        int index;
+        int index;//子交换机的index
         NCCLCHECKGOTO(ncclTopoIdToIndex(system, PCI, subSwIds[s], &index), ret, fail);
         struct ncclTopoNode* sub = system->nodes[PCI].nodes+index;
         // Connect all sub PCI devices to the parent switch
+        // 3. 将子交换机的所有下挂设备直接挂到父交换机下
         for (int l=0; l<sub->nlinks; l++) {
           struct ncclTopoNode* remNode = sub->links[l].remNode;
           if (remNode == pciSwitch) continue;
@@ -230,9 +242,11 @@ ncclResult_t ncclTopoFlattenBcmSwitches(struct ncclTopoSystem* system) {
             ret = ncclInternalError;
             goto fail;
           }
+          // 父交换机添加到设备的连接(其实就是把连接信息拷贝过去)
           memcpy(pciSwitch->links+pciSwitch->nlinks, sub->links+l, sizeof(struct ncclTopoLink));
           pciSwitch->nlinks++;
           // Update link from PCI device -> parent PCI switch
+          // 设备的上级指针指向父交换机
           for (int rl=0; rl<remNode->nlinks; rl++) {
             if (remNode->links[rl].remNode == sub) {
               remNode->links[rl].remNode = pciSwitch;
@@ -240,12 +254,15 @@ ncclResult_t ncclTopoFlattenBcmSwitches(struct ncclTopoSystem* system) {
             }
           }
         }
+        // 4. 移除子交换机节点
         NCCLCHECKGOTO(ncclTopoRemoveNode(system, PCI, index), ret, fail);
       }
       // Set subdevice to 0xffff to make sure we don't merge this switch again.
+      // 5 将父交换机的subdevice字段置为0xffff ，防止后续重复合并
       pciSwitch->pci.device |= 0xffff;
       free(subSwIds);
       // Restart, as system->nodes[PCI].nodes has changed.
+      // 6. 节点数组变化，重头遍历
       s = 0;
       continue;
 fail:
@@ -255,7 +272,7 @@ fail:
   }
   return ret;
 }
-
+//该函数的目的是 将同一系统（systemId相同）下的所有CPU节点两两互连 ，为后续的路径搜索和带宽建模提供完整的CPU互联信息。
 ncclResult_t ncclTopoConnectCpus(struct ncclTopoSystem* system) {
   // And connect all CPU nodes together
   for (int n=0; n<system->nodes[CPU].count; n++) {
@@ -265,6 +282,7 @@ ncclResult_t ncclTopoConnectCpus(struct ncclTopoSystem* system) {
       if (n == p || (NCCL_TOPO_ID_SYSTEM_ID(cpu1->id) != NCCL_TOPO_ID_SYSTEM_ID(cpu2->id))) continue;
       float bw;
       NCCLCHECK(ncclTopoGetInterCpuBw(cpu1, &bw));
+      //这里只建立了 cpu1 到 cpu2 的单向连接，但由于循环是两两配对，实际上每对CPU之间都会建立双向连接。
       NCCLCHECK(ncclTopoConnectNodes(cpu1, cpu2, LINK_SYS, bw));
     }
   }
@@ -315,10 +333,17 @@ ncclResult_t ncclTopoPrint(struct ncclTopoSystem* s) {
   NCCLCHECK(ncclTopoPrintPaths(s));
   return ncclSuccess;
 }
-
+//规范 PCI 树的遍历顺序 ，确保每个节点的“上行链路”在 links 数组的最后，便于后续遍历和处理。
+// upNode ：当前节点的“父节点”或“上游节点”，用于递归时避免回头。
+// 通过这种排序，NCCL 能够更快地遍历和分析 PCIe 拓扑，尤其是在需要查找最优通信路径、构建通信通道时，能减少无效遍历和复杂判断。
 static ncclResult_t ncclTopoSort(struct ncclTopoNode* node, struct ncclTopoNode* upNode) {
   // Shift all links to have upLink as last link
   if (upNode) {
+    //如果 upNode 非空，说明当前节点是递归下来的，需要把指向 upNode 的那条 link 移到 links 数组的最后。
+    /*
+    - 这样做的目的是：在遍历 PCI 树时，优先处理“下行”链路（即从父节点到子节点），最后再处理“上行”链路（回到父节点），便于后续遍历和排序。
+- 实现方式是：先找到指向 upNode 的 link，保存下来，然后把后面的 link 依次前移，最后把 upLink 放到最后。
+    */
     int l=0;
     while (node->links[l].remNode != upNode) l++;
     struct ncclTopoLink upLink;
@@ -342,8 +367,17 @@ static ncclResult_t ncclTopoSort(struct ncclTopoNode* node, struct ncclTopoNode*
 // 1. NVLinks (already the case)
 // 2. PCI down
 // 3. PCI up
-// 4. SYS (already the case)
+// 4. SYS (already the case) 
+/*
+对整个系统的 PCI 拓扑结构进行规范化排序
+代码注释说明了排序的目标顺序：
+1. NVLinks（已排序好） 这些链路在 NCCL 拓扑中已经按照需求排序好，通常优先级最高
+2. PCI 下行（优先处理） 指的是 PCIe 拓扑中“向下”的链路，也就是从父节点（如 CPU、PCIe 交换机）到子节点（如下一级 PCIe 交换机、GPU、NIC）的连接。 这种方向的链路在遍历 PCIe 树时优先处理，有助于高效地递归遍历所有下挂设备
+3. PCI 上行（最后处理）  在排序时，这类链路会被放到 links 数组的最后，目的是在遍历时最后处理回溯到父节点的情况，避免重复遍历和死循环（NCCL在做路径搜索、带宽统计、最优路由选择时，既可能从上往下查找（down），也可能需要从下往上回溯（up））
+4. SYS（已排序好） 指的是系统级别的互联（如 CPU 之间的互联、NUMA 节点之间的互联），这些链路在 NCCL 拓扑中也已经按照需求排序好。
+*/
 ncclResult_t ncclTopoSortSystem(struct ncclTopoSystem* system) {
+  // 遍历所有 CPU 节点
   for (int n=0; n<system->nodes[CPU].count; n++) NCCLCHECK(ncclTopoSort(system->nodes[CPU].nodes+n, NULL));
   return ncclSuccess;
 }
@@ -389,7 +423,7 @@ ncclResult_t ncclTopoAddNic(struct ncclXmlNode* xmlNic, struct ncclTopoSystem* s
   }
   return ncclSuccess;
 }
-
+//这里没有加入nvlinks等连接信息，和addCpu不一样，所以后面会调用别的函数添加连接信息
 ncclResult_t ncclTopoAddGpu(struct ncclXmlNode* xmlGpu, struct ncclTopoSystem* system, struct ncclTopoNode* gpu) {
   NCCLCHECK(xmlGetAttrInt(xmlGpu, "sm", &gpu->gpu.cudaCompCap));
   NCCLCHECK(xmlGetAttrInt(xmlGpu, "rank", &gpu->gpu.rank));
@@ -404,7 +438,8 @@ struct kvDict kvDictPciGen[] = {
   { "2.5 GT/s", 15 }, { "5 GT/s", 30 }, { "8 GT/s", 60 }, { "16 GT/s", 120 }, { "32 GT/s", 240 }, /* Kernel 5.6 and earlier */
   { "2.5 GT/s PCIe", 15 }, { "5.0 GT/s PCIe", 30 }, { "8.0 GT/s PCIe", 60 }, { "16.0 GT/s PCIe", 120 }, { "32.0 GT/s PCIe", 240 }, { "64.0 GT/s PCIe", 480 },
   { NULL, 60 /* Default fallback */ } }; // x100 Mbps per lane
-ncclResult_t ncclTopoAddPci(struct ncclXmlNode* xmlPci, struct ncclTopoSystem* system, struct ncclTopoNode* parent, int systemId, int numaId) {
+//负责将一个 PCI 设备节点（以及其下属的 GPU/NIC/PCI 子节点）添加到 NCCL 拓扑结构中（会递归调用）。而连接却只添加了网卡和父节点之间的连接信息
+  ncclResult_t ncclTopoAddPci(struct ncclXmlNode* xmlPci, struct ncclTopoSystem* system, struct ncclTopoNode* parent, int systemId, int numaId) {
   const char* str;
 
   int type;
@@ -418,29 +453,34 @@ ncclResult_t ncclTopoAddPci(struct ncclXmlNode* xmlPci, struct ncclTopoSystem* s
   struct ncclTopoNode* node = NULL;
   struct ncclXmlNode* xmlGpu = NULL;
   NCCLCHECK(xmlGetSub(xmlPci, "gpu", &xmlGpu));
+  //处理 GPU 子节点,大多数情况下，一个 PCIe 设备节点下只会挂载一个 GPU
   if (xmlGpu != NULL) {
     type = GPU;
     int index;
     NCCLCHECK(xmlGetAttrIndex(xmlGpu, "rank", &index));
-    if (index == -1) return ncclSuccess;
+    if (index == -1) return ncclSuccess;//检查 <gpu> 是否有 rank 属性（无则跳过）。
     NCCLCHECK(ncclTopoCreateNode(system, &node, type, NCCL_TOPO_ID(systemId, busId)));
+    //创建 GPU 节点，并调用 ncclTopoAddGpu 填充 GPU 信息。
     NCCLCHECK(ncclTopoAddGpu(xmlGpu, system, node));
   }
   struct ncclXmlNode* xmlNic = NULL;
   NCCLCHECK(xmlGetSub(xmlPci, "nic", &xmlNic));
   if (xmlNic != NULL) {
     type = NIC;
-    // Ignore sub device ID and merge multi-port NICs into one PCI device.
+    // Ignore sub device ID and merge multi-port NICs into one PCI device. 对于多端口 NIC，会合并为一个节点，避免重复。
     struct ncclTopoNode* nicNode = NULL;
+    // 生成本地唯一 NIC ID（结合 NUMA 域和 busId），再结合 systemId 得到全局唯一ID。
     int64_t localNicId = NCCL_TOPO_LOCAL_NIC_ID(numaId, busId);
     int64_t id = NCCL_TOPO_ID(systemId, localNicId);
-    NCCLCHECK(ncclTopoGetNode(system, &nicNode, type, id));
+    NCCLCHECK(ncclTopoGetNode(system, &nicNode, type, id));//查找该 NIC 节点是否已存在
     if (nicNode == NULL) {
+      //如果不存在则创建该 NIC 节点，并将其赋值给 node ，以便后续与父节点连接。
       NCCLCHECK(ncclTopoCreateNode(system, &nicNode, type, id));
       node = nicNode; // Connect it to parent later on
     }
+    //处理 NIC 的详细信息
     NCCLCHECK(ncclTopoAddNic(xmlNic, system, nicNode, systemId));
-  } else if (type == PCI) {
+  } else if (type == PCI) {//创建 PCI 设备节点，并解析
     NCCLCHECK(ncclTopoCreateNode(system, &node, type, NCCL_TOPO_ID(systemId, busId)));
     NCCLCHECK(xmlGetAttr(xmlPci, "vendor", &str));
     if (str) node->pci.device += strtol(str, NULL, 0) << 48;
@@ -453,6 +493,7 @@ ncclResult_t ncclTopoAddPci(struct ncclXmlNode* xmlPci, struct ncclTopoSystem* s
 
     for (int s=0; s<xmlPci->nSubs; s++) {
       struct ncclXmlNode* xmlSubPci = xmlPci->subs[s];
+      //遍历所有子节点（除了 "pcilink"），递归调用 ncclTopoAddPci 继续构建 PCI 设备树。
       if (strcmp(xmlSubPci->name, "pcilink") != 0) { // PCI links will be added later
         NCCLCHECK(ncclTopoAddPci(xmlSubPci, system, node, systemId, numaId));
       }
@@ -460,14 +501,17 @@ ncclResult_t ncclTopoAddPci(struct ncclXmlNode* xmlPci, struct ncclTopoSystem* s
   }
 
   if (node) {
+  //获取该 PCI 设备与父节点（parent）之间的链路宽度（link_width）和速率（link_speed），计算出带宽，然后在拓扑结构中建立双向的 PCI 连接。
     int width, speed;
     NCCLCHECK(xmlGetAttrInt(xmlPci, "link_width", &width));
     NCCLCHECK(xmlGetAttrStr(xmlPci, "link_speed", &str));
 
-    // Manage cases where speed was not indicated in /sys
+    // Manage cases where speed was not indicated in /sys 如果 link_width 没有指定则默认 16（即 x16）。
     if (width == 0) width = 16;
+    //用 kvConvertToInt 把速率字符串（如 "8.0 GT/s"）转换为数值（单位是每通道100Mbps）。
     NCCLCHECK(kvConvertToInt(str, &speed, kvDictPciGen)); // Values in 100Mbps, per lane (we want GB/s in the end)
-
+      //计算总带宽：width * speed / 80.0，单位是 GB/s。
+      //调用 ncclTopoConnectNodes，分别在 node→parent 和 parent→node 方向建立 PCI 类型的连接，并设置带宽。
     NCCLCHECK(ncclTopoConnectNodes(node, parent, LINK_PCI, width*speed/80.0));
     NCCLCHECK(ncclTopoConnectNodes(parent, node, LINK_PCI, width*speed/80.0));
   }
@@ -477,10 +521,12 @@ ncclResult_t ncclTopoAddPci(struct ncclXmlNode* xmlPci, struct ncclTopoSystem* s
 struct kvDict kvDictCpuArch[] = { { "x86_64", NCCL_TOPO_CPU_ARCH_X86 }, { "arm64", NCCL_TOPO_CPU_ARCH_ARM }, { "ppc64", NCCL_TOPO_CPU_ARCH_POWER }, { NULL, 0 } };
 struct kvDict kvDictCpuVendor[] = { { "GenuineIntel", NCCL_TOPO_CPU_VENDOR_INTEL }, { "AuthenticAMD", NCCL_TOPO_CPU_VENDOR_AMD }, { "CentaurHauls", NCCL_TOPO_CPU_VENDOR_ZHAOXIN }, { "  Shanghai  ", NCCL_TOPO_CPU_VENDOR_ZHAOXIN }, { NULL, 0 } };
 
+//根据 XML 中 <cpu> 节点的 host_hash 属性，确定当前 CPU 所属的 systemId ，并将其返回。systemId 用于区分多主机（多系统）场景下的不同主机。
+//保证每个不同 host_hash 的主机都能分配到唯一的 systemId，便于后续拓扑结构的组织和查找。
 ncclResult_t ncclGetSystemId(struct ncclTopoSystem* system, struct ncclXmlNode* xmlCpu, int* systemIdPtr) {
   const char* hostHashStr;
-  NCCLCHECK(xmlGetAttr(xmlCpu, "host_hash", &hostHashStr));
-  uint64_t hostHash = hostHashStr ? strtoull(hostHashStr, NULL, 16) : 0;
+  NCCLCHECK(xmlGetAttr(xmlCpu, "host_hash", &hostHashStr));//获取 host_hash 属性
+  uint64_t hostHash = hostHashStr ? strtoull(hostHashStr, NULL, 16) : 0;//如果 hostHashStr 存在，则用 strtoull 按 16 进制转换为 uint64_t 类型的 hostHash；否则 hostHash 为 0。
   int systemId;
   for (systemId=0; systemId<system->nHosts; systemId++) if (system->hostHashes[systemId] == hostHash) break;
   if (systemId == system->nHosts) system->hostHashes[system->nHosts++] = hostHash;
@@ -488,20 +534,21 @@ ncclResult_t ncclGetSystemId(struct ncclTopoSystem* system, struct ncclXmlNode* 
   return ncclSuccess;
 }
 
-
+//向 NCCL 内部拓扑结构体中添加一个 CPU 节点，并递归添加其下挂的 PCI 设备和 NIC 设备 。
 ncclResult_t ncclTopoAddCpu(struct ncclXmlNode* xmlCpu, struct ncclTopoSystem* system) {
   int numaId;
   NCCLCHECK(xmlGetAttrInt(xmlCpu, "numaid", &numaId));
   int systemId;
-  NCCLCHECK(ncclGetSystemId(system, xmlCpu, &systemId));
+  NCCLCHECK(ncclGetSystemId(system, xmlCpu, &systemId));//根据主机哈希等信息，确定该 CPU 所属的 systemId（用于多主机场景）
   struct ncclTopoNode* cpu;
-  NCCLCHECK(ncclTopoCreateNode(system, &cpu, CPU, NCCL_TOPO_ID(systemId, numaId)));
+  NCCLCHECK(ncclTopoCreateNode(system, &cpu, CPU, NCCL_TOPO_ID(systemId, numaId)));//在 NCCL 拓扑结构体中创建一个 CPU 节点，唯一标识通过systemId+numaId生成。
   const char* str;
   NCCLCHECK(xmlGetAttr(xmlCpu, "affinity", &str));
+  //如果 XML 中有 affinity 属性，则解析并设置 CPU 的亲和性掩码。
   if (str != NULL) {
     NCCLCHECK(ncclStrToCpuset(str, &cpu->cpu.affinity));
   }
-
+  //解析并设置 CPU 的架构（如 x86_64、arm64）、厂商（Intel、AMD、兆芯等）、型号（如 Skylake、YONGFENG 等）。
   NCCLCHECK(xmlGetAttrStr(xmlCpu, "arch", &str));
   NCCLCHECK(kvConvertToInt(str, &cpu->cpu.arch, kvDictCpuArch));
   if (cpu->cpu.arch == NCCL_TOPO_CPU_ARCH_X86) {
@@ -519,6 +566,11 @@ ncclResult_t ncclTopoAddCpu(struct ncclXmlNode* xmlCpu, struct ncclTopoSystem* s
       if (familyId == 7 && modelId == 0x5B) cpu->cpu.model = NCCL_TOPO_CPU_TYPE_YONGFENG;
     }
   }
+  /*
+  遍历 <cpu> 节点下的所有子节点：
+- 如果是 <pci> ，递归调用 ncclTopoAddPci ，将 PCI 设备挂到该 CPU 下。
+- 如果是 <nic> ，查找或创建 NIC 节点，并与 CPU 互连，然后递归添加 NIC 下的网络设备。
+  */
   for (int s=0; s<xmlCpu->nSubs; s++) {
     struct ncclXmlNode* node = xmlCpu->subs[s];
     if (strcmp(node->name, "pci") == 0) NCCLCHECK(ncclTopoAddPci(node, system, cpu, systemId, numaId));
@@ -537,7 +589,7 @@ ncclResult_t ncclTopoAddCpu(struct ncclXmlNode* xmlCpu, struct ncclTopoSystem* s
   }
   return ncclSuccess;
 }
-
+//遍历 XML 拓扑描述，找到所有 NVLink 连接，并在 NCCL 拓扑结构中为 GPU 与 GPU、GPU 与 CPU、GPU 与 NVLink Bridge 等节点之间建立 NVLink 链路，准确反映实际硬件的高速互联结构。
 ncclResult_t ncclTopoAddNvLinks(struct ncclXmlNode* node, struct ncclTopoSystem* system, const char* parentBusId, int systemId) {
   if (strcmp(node->name, "nvlink") == 0) {
     struct ncclTopoNode* gpu = NULL;
@@ -550,33 +602,36 @@ ncclResult_t ncclTopoAddNvLinks(struct ncclXmlNode* node, struct ncclTopoSystem*
       return ncclInternalError;
     }
     int count;
-    NCCLCHECK(xmlGetAttrInt(node, "count", &count));
+    NCCLCHECK(xmlGetAttrInt(node, "count", &count));//读取 count 属性，表示 NVLink 的数量（带宽倍数）。
     const char* targetClass;
-    NCCLCHECK(xmlGetAttrStr(node, "tclass", &targetClass));
+    NCCLCHECK(xmlGetAttrStr(node, "tclass", &targetClass));//读取 tclass 属性，判断 NVLink 另一端的类型（GPU/CPU/其他）。
     int targetType;
     NCCLCHECK(kvConvertToInt(targetClass, &targetType, kvDictPciClass));
     struct ncclTopoNode* remote = NULL;
     if (targetType == GPU) {
-      // NVL P2P connection to another GPU
-      const char* target;
+      // NVL P2P connection to another GPU 如果目标是 GPU，根据 target 属性找到目标 GPU。
+      const char* target; // target其实就是busid
       NCCLCHECK(xmlGetAttrStr(node, "target", &target));
       int64_t busId;
       NCCLCHECK(busIdToInt64(target, &busId));
       NCCLCHECK(ncclTopoGetNode(system, &remote, GPU, NCCL_TOPO_ID(systemId, busId)));
     } else if (targetType == CPU) {
-      // NVL connection to the local CPU
+      // NVL connection to the local CPU 有些cpu是支持连接nvl的，但是目前intel、amd应该是都不支持的。（IBM的好像有支持的）
       NCCLCHECK(findLocalCpu(gpu, &remote));
-    } else {
+    } else {//其他情况（如 IBM/Power NVLink bridge），创建或获取 NVS 节点。
       if (system->nodes[NVS].count == 0) {
         NCCLCHECK(ncclTopoCreateNode(system, &remote, NVS, 0));
       } else {
-        remote = system->nodes[NVS].nodes;
+        remote = system->nodes[NVS].nodes;// 这里是nodes
       }
     }
-    if (remote) {
+    if (remote) {//计算 NVLink 带宽（根据 GPU 架构）
       float nvlBw = ncclTopoNVLinkBw(gpu->gpu.cudaCompCap);
+      // 调用 ncclTopoConnectNodes 在 GPU 和目标节点之间建立 NVLink 连接，带宽为 count * nvlBw 。
       NCCLCHECK(ncclTopoConnectNodes(gpu, remote, LINK_NVL, count*nvlBw));
       if (remote->type != GPU) {
+        //如果目标不是 GPU，还要反向建立一条连接。 对于 GPU 与 GPU 的 NVLink，通常只需要单向建立连接（因为后续会对称地处理每一对 GPU，最终形成双向链路）。
+       //但如果目标不是 GPU（比如 CPU 或 NVS），这些节点本身不会主动去遍历并建立到 GPU 的 NVLink 连接，所以需要在这里 手动反向再加一条链路 ，保证拓扑结构的对称性和完整性。
         NCCLCHECK(ncclTopoConnectNodes(remote, gpu, LINK_NVL, count*nvlBw));
       }
     }
@@ -586,18 +641,20 @@ ncclResult_t ncclTopoAddNvLinks(struct ncclXmlNode* node, struct ncclTopoSystem*
     }
     const char* busId;
     NCCLCHECK(xmlGetAttr(node, "busid", &busId));
+    //如果当前节点不是 "nvlink" ，则递归处理所有子节点，传递合适的 busId 和 systemId。
     for (int s=0; s<node->nSubs; s++) {
       NCCLCHECK(ncclTopoAddNvLinks(node->subs[s], system, busId ? busId : parentBusId, systemId));
     }
   }
   return ncclSuccess;
 }
-
+//为所有 PCI 交换机之间建立本地连接（多级 PCIe Switch 之间的直连） pcilink 在 NCCL 拓扑结构和 XML 描述文件中，指的是 PCI 交换机（PCI Switch）之间的本地连接 。
+//它通常作为某个 PCI 交换机节点的子节点，表示“本交换机与哪个目标交换机有直接链路”。
 ncclResult_t ncclTopoAddPciLinks(struct ncclXmlNode* node, struct ncclTopoSystem* system, const char* parentBusId, int systemId) {
   if (strcmp(node->name, "pcilink") == 0) {
     struct ncclTopoNode* pci = NULL;
     int64_t pBusId;
-    NCCLCHECK(busIdToInt64(parentBusId, &pBusId));
+    NCCLCHECK(busIdToInt64(parentBusId, &pBusId)); //首先通过 parentBusId 找到本地 PCI 交换机节点（pci）。
     pBusId = NCCL_TOPO_ID(systemId, pBusId);
     NCCLCHECK(ncclTopoGetNode(system, &pci, PCI, pBusId));
     if (pci == NULL) {
@@ -606,10 +663,13 @@ ncclResult_t ncclTopoAddPciLinks(struct ncclXmlNode* node, struct ncclTopoSystem
     }
     struct ncclTopoNode* remote = NULL;
     const char* target;
-    NCCLCHECK(xmlGetAttrStr(node, "target", &target));
+    NCCLCHECK(xmlGetAttrStr(node, "target", &target));//然后读取 target 属性，找到目标 PCI 交换机节点（remote
     int64_t busId;
     NCCLCHECK(busIdToInt64(target, &busId));
     NCCLCHECK(ncclTopoGetNode(system, &remote, PCI, NCCL_TOPO_ID(systemId, busId)));
+    //在本地 PCI 交换机和目标 PCI 交换机之间建立一条本地连接（LINK_LOC），带宽为 LOC_BW
+    // PCI 交换机之间的本地连接，通常只需要单向建模即可满足 NCCL 的路径搜索和带宽计算需求。
+    // PCIe 拓扑的遍历和路径查找，往往只需要从上级交换机到下级交换机
     if (remote) NCCLCHECK(ncclTopoConnectNodes(pci, remote, LINK_LOC, LOC_BW));
   } else {
     if (strcmp(node->name, "cpu") == 0) {
@@ -624,7 +684,11 @@ ncclResult_t ncclTopoAddPciLinks(struct ncclXmlNode* node, struct ncclTopoSystem
   return ncclSuccess;
 }
 
-
+// 递归遍历 XML 拓扑树，查找所有名为 "c2c" （主要指的是 GPU 与本地 CPU 之间的高速直连链路）的节点，并在 NCCL 拓扑结构中为 GPU 与本地 CPU 之间建立 C2C 链路。
+/*
+​​NVLink-C2C​​（​​NVLink Chip-to-Chip​​）是 NVIDIA 专门为其 ​​Grace CPU 和 Hopper GPU​​ 设计的一种 ​​超高速、低延迟的芯片间互连技术​​，用于构建 ​​Grace Hopper 超级芯片（Superchip）​​。
+它不同于传统的 NVLink（用于 GPU-GPU 互联），而是专门优化了 ​​CPU 和 GPU 之间的直接通信​​，显著提升了异构计算的效率。
+*/
 ncclResult_t ncclTopoAddC2c(struct ncclXmlNode* node, struct ncclTopoSystem* system, const char* parentBusId, int systemId) {
   if (strcmp(node->name, "c2c") == 0) {
     struct ncclTopoNode* gpu = NULL;
@@ -644,39 +708,41 @@ ncclResult_t ncclTopoAddC2c(struct ncclXmlNode* node, struct ncclTopoSystem* sys
     struct ncclTopoNode* cpu = NULL;
     NCCLCHECK(findLocalCpu(gpu, &cpu));
     if (cpu == NULL) return ncclSuccess;
-    NCCLCHECK(ncclTopoConnectNodes(gpu, cpu, LINK_NVL, c2cBw));
+    NCCLCHECK(ncclTopoConnectNodes(gpu, cpu, LINK_NVL, c2cBw));//调用 ncclTopoConnectNodes ，在 GPU 和 CPU 之间建立双向的 C2C 链路，带宽为 c2cBw 。
     NCCLCHECK(ncclTopoConnectNodes(cpu, gpu, LINK_NVL, c2cBw));
-  } else {
-    if (strcmp(node->name, "cpu") == 0) {
+  } else {//如果当前节点不是 "c2c" ，则递归处理所有子节点
+    if (strcmp(node->name, "cpu") == 0) {//如果节点是 "cpu" ，则更新 systemId
       NCCLCHECK(ncclGetSystemId(system, node, &systemId));
     }
     const char* busId;
-    NCCLCHECK(xmlGetAttr(node, "busid", &busId));
+    NCCLCHECK(xmlGetAttr(node, "busid", &busId));//获取 busId ，递归调用 ncclTopoAddC2c 处理所有子节点。
     for (int s=0; s<node->nSubs; s++) {
       NCCLCHECK(ncclTopoAddC2c(node->subs[s], system, busId ? busId : parentBusId, systemId));
     }
   }
   return ncclSuccess;
 }
-
+//从 XML 文件中 完整构建 NCCL 内部的系统拓扑结构，包括节点、链路、特殊处理等
 ncclResult_t ncclTopoGetSystemFromXml(struct ncclXml* xml, struct ncclTopoSystem** topoSystem, const uint64_t localHostHash) {
   NCCLCHECK(ncclCalloc(topoSystem, 1));
   struct ncclTopoSystem* system = *topoSystem;
   struct ncclXmlNode* topNode;
-  NCCLCHECK(xmlFindTag(xml, "system", &topNode));
+  NCCLCHECK(xmlFindTag(xml, "system", &topNode));//在 XML 结构中查找名为 "system" 的根节点。
+  //遍历 system 下的所有子节点，添加 CPU 节点到系统拓扑结构体中。（同时也会把CPU下挂载的子节点加入）
   for (int s=0; s<topNode->nSubs; s++) {
     struct ncclXmlNode* node = topNode->subs[s];
     if (strcmp(node->name, "cpu") == 0) NCCLCHECK(ncclTopoAddCpu(node, *topoSystem));
   }
+  //遍历所有主机哈希，找到与本地主机哈希匹配的 systemId，并记录下来。
   for (int systemId=0; systemId<system->nHosts; systemId++) if (system->hostHashes[systemId] == localHostHash) system->systemId = systemId;
-
+  //分别解析并添加 NVLink、C2C、PCILink 链路到系统拓扑结构体中。
   NCCLCHECK(ncclTopoAddNvLinks(topNode, *topoSystem, NULL, 0));
-  NCCLCHECK(ncclTopoAddC2c(topNode, *topoSystem, NULL, 0));
+  NCCLCHECK(ncclTopoAddC2c(topNode, *topoSystem, NULL, 0));//gpu-cpu
   NCCLCHECK(ncclTopoAddPciLinks(topNode, *topoSystem, NULL, 0));
 
-  NCCLCHECK(ncclTopoFlattenBcmSwitches(*topoSystem));
-  NCCLCHECK(ncclTopoConnectCpus(*topoSystem));
-  NCCLCHECK(ncclTopoSortSystem(*topoSystem));
+  NCCLCHECK(ncclTopoFlattenBcmSwitches(*topoSystem)); //处理特殊的 BCM 交换机结构，将其“扁平化”以简化后续拓扑分析。
+  NCCLCHECK(ncclTopoConnectCpus(*topoSystem));//将所有 CPU 节点互联，补全系统间的连接。
+  NCCLCHECK(ncclTopoSortSystem(*topoSystem));//对整个拓扑结构进行排序，优化遍历和查找效率。
 
   return ncclSuccess;
 }

@@ -13,15 +13,16 @@
 #include <stdint.h>
 #include <algorithm> // For std::min/std::max
 #include "nccl.h"
-
+ //如果其他模块没有提供，没提供就调用本模块在中weak声明的。
+ // pfunc 会自动指向 func 的实现
 #ifdef PROFAPI
 #define NCCL_API(ret, func, args...)        \
     __attribute__ ((visibility("default"))) \
-    __attribute__ ((alias(#func)))          \ // pfunc 会自动指向 func 的实现
+    __attribute__ ((alias(#func)))          \ 
     ret p##func (args);                     \
     extern "C"                              \
     __attribute__ ((visibility("default"))) \
-    __attribute__ ((weak))                  \ //如果其他模块没有提供，没提供就调用本模块在中weak声明的。
+    __attribute__ ((weak))                  \
     ret func(args)
 #else
 #define NCCL_API(ret, func, args...)        \
