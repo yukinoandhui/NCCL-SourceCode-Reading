@@ -219,7 +219,7 @@ typedef struct {
   // Create a virtual NIC given the specified properties, which can be accessed at device index d
   ncclResult_t (*makeVDevice)(int* d, ncclNetVDeviceProps_t* props);
 } ncclCollNet_v9_t;
-//ncclNet_t提供基础的网络通信功能,主要用于节点间的点对点通信，而ncclCollNet_t专门用于高效实现集体通信操作，如规约、广播等，一个操作涉及多个节点
+//ncclNet_t提供基础的网络通信功能,主要用于节点间的点对点通信，而ncclCollNet_t(针对sharp的)专门用于高效实现集体通信操作，如规约、广播等，一个操作涉及多个节点
 typedef ncclCollNet_v9_t ncclCollNet_t;
 
 #define NCCL_COLLNET_PLUGIN_SYMBOL ncclCollNetPlugin_v9

@@ -1540,7 +1540,8 @@ fail:
   if (netLockHeld) pthread_mutex_unlock(&netLock);
   goto exit;
 }
-
+// 用于查找与指定节点（type, index）之间，所有到 resultType 类型节点的最优路径（带宽最大且路径类型最优）的节点索引。
+// 如果有多个，就都记录下来
 static ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index, int resultType,
                                      int locals[NCCL_TOPO_MAX_NODES], int* localCount, int* pathType) {
   int minType = PATH_DIS;
@@ -1548,7 +1549,9 @@ static ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, in
   int count = 0;
   struct ncclTopoLinkList* paths = system->nodes[type].nodes[index].paths[resultType];
   if (paths == NULL) { *localCount = 0; return ncclSuccess; }
+  
   for (int i=0; i<system->nodes[resultType].count; i++) {
+    //如果当前节点到第 i 个节点的带宽更大，或者带宽相同但路径类型更优（数值更小），则更新 maxBw 和 minType，并重置 count。
     if (paths[i].bw > maxBw || (paths[i].bw == maxBw && paths[i].type < minType)) {
       maxBw = paths[i].bw;
       minType = paths[i].type;
@@ -1591,13 +1594,14 @@ ncclResult_t getLocalNetCountByBw(struct ncclTopoSystem* system, int gpu, int *c
 
   return ncclSuccess;
 }
-
+//作用是根据 GPU 的 rank 和 channelId，查找该 GPU 在该通道下直连的 NET 节点，并且考虑了负载均衡。
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int64_t* id, int* dev) {
   int gpu;
   NCCLCHECK(ncclTopoRankToIndex(system, rank, &gpu));
 
   int localNets[NCCL_TOPO_MAX_NODES];
   int localNetCount;
+  //查找所有与该 GPU 直连的 NET 节点。
   NCCLCHECK(ncclTopoGetLocal(system, GPU, gpu, NET, localNets, &localNetCount, NULL));
   if (localNetCount==0) {
     WARN("Could not find any local path from gpu %d to net.", gpu);
@@ -1606,16 +1610,20 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
 
   int localGpus[NCCL_TOPO_MAX_NODES];
   int localGpuCount;
+  //查找与第一个直连 NET 节点直连的所有 GPU。这一步是为了后续做 channel 到 net 的分配映射。只有localGpuCount有用。
   NCCLCHECK(ncclTopoGetLocal(system, NET, localNets[0], GPU, localGpus, &localGpuCount, NULL));
-
-  int net = system->nodes[GPU].nodes[gpu].gpu.dev;
+// 避免所有 GPU 都优先选择同一块网卡
+  int net = system->nodes[GPU].nodes[gpu].gpu.dev;//- 这行代码的目的是让每个 GPU 默认优先选择与自己 dev 号相同的 NET（网卡）作为通信对象。(不考虑mirrorBits的情况下)
+  //- 这样做的好处是：在常见的对称拓扑（比如 4 个 GPU 直连 4 个网卡，每个 GPU 对应一个网卡）时，能保证每个 GPU 的 channel 0 默认走本地直连的网卡，通信路径最短、带宽最高。
+  //如果 localNetCount 是 2 的幂，则对 net 做 mirrorBits 操作（位反转），用于多网卡场景下做负载均衡。
   if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
-  net += channelId%(DIVUP(localNetCount,localGpuCount));
+  net += channelId%(DIVUP(localNetCount,localGpuCount));//然后根据 channelId 做一个轮转分配，确保不同 channel 能均匀分配到不同的 net 上(尽量分布到不同的网卡，进一步提升带宽利用率。)
+  //得到目标 NET 节点的索引，并返回其 id 和 dev
   if (id) *id = system->nodes[NET].nodes[localNets[net%localNetCount]].id;
   if (dev) *dev = system->nodes[NET].nodes[localNets[net%localNetCount]].net.dev;
   return ncclSuccess;
 }
-
+//获取与net相连的gpu
 ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int64_t netId, int* gpuIndex) {
   ncclResult_t ret = ncclSuccess;
   int netIndex;
@@ -1626,11 +1634,14 @@ ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int64_t netId, i
   NCCLCHECK(ncclTopoGetLocal(system, NET, netIndex, GPU, localGpus, &localGpuCount, NULL));
 
   int foundGpu = -1;
+  //外层循环遍历所有channel（通道），NCCL支持多通道通信。
+  //AI说这里这样做是因为net 到 gpu 的连接和 gpu 到 net 的连接，在多通道、多路径的复杂拓扑下， 不一定是完全对称的 。
   for (int c=0; c<MAXCHANNELS; c++) {
     for (int lg=0; lg<localGpuCount; lg++) {
       int g = localGpus[lg];
       struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
       int64_t id;
+      //获取该GPU在当前channel下拓扑可达的NET设备ID。并且考虑了负载均衡。
       NCCLCHECK(ncclTopoGetLocalNet(system, gpu->gpu.rank, c, &id, NULL));
       if (netId == id) {
         foundGpu = g;
@@ -1646,7 +1657,7 @@ exit:
 /****************************/
 /* External query functions */
 /****************************/
-
+// 系统里第一个cpu的信息。
 ncclResult_t ncclTopoCpuType(struct ncclTopoSystem* system, int* arch, int* vendor, int* model) {
   *arch = system->nodes[CPU].nodes[0].cpu.arch;
   *vendor = system->nodes[CPU].nodes[0].cpu.vendor;

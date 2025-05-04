@@ -40,7 +40,7 @@ struct ncclPeerInfo {
   int gdrSupport;
   uint64_t hostHash;
   uint64_t pidHash;
-  dev_t shmDev;
+  dev_t shmDev;//这是 Linux 系统中用于标识设备（如磁盘、分区、内存等）的标准类型。
   int64_t busId;
   struct ncclComm* comm;
   int cudaCompCap;

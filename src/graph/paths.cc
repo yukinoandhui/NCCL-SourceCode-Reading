@@ -40,11 +40,10 @@ static ncclResult_t getPath(struct ncclTopoSystem* system, struct ncclTopoNode* 
 }
 
 NCCL_PARAM(NvbDisable, "NVB_DISABLE", 0);
-//该函数以 baseNode 为起点，使用 BFS 算法，递归地为系统中所有同类型节点建立最优路径（带宽最大、跳数最少），并记录路径类型。
+//该函数以 baseNode 为起点，使用 BFS 算法，为系统中所有其他节点建立到baseNode的最优路径（带宽最大、跳数最少），并记录路径类型。
 /*
 - 最短跳数优先 ：优先选择跳数更少的路径（即 BFS 的天然特性）。
 - 带宽最大优先 ：在跳数相同的情况下，选择带宽更大的路径。
-- 路径类型优先 ：路径类型（如 NVLink、PCIe、Host Bridge 等）也会影响优先级，通常 NVLink > PCIe > Host Bridge。
 - 避免环路和重复 ：每个节点只在更优条件下才会被加入下一轮 BFS 队列，避免重复遍历。
 spfa算法
 */
@@ -198,11 +197,12 @@ ncclResult_t ncclTopoPrintPaths(struct ncclTopoSystem* system) {
   }
   return ncclSuccess;
 }
-
+//在gpu到达所有cpu的路径中，找到路径最短的cpu，作为localCpu，也就是找到最近的cpu
 ncclResult_t ncclGetLocalCpu(struct ncclTopoSystem* system, int gpu, int* retCpu) {
   // Find the closest CPU to a GPU
   int minHops = 0;
   int localCpu = -1;
+
   struct ncclTopoLinkList* paths = system->nodes[GPU].nodes[gpu].paths[CPU];
   for (int c=0; c<system->nodes[CPU].count; c++) {
     int hops = paths[c].count;
@@ -218,7 +218,8 @@ ncclResult_t ncclGetLocalCpu(struct ncclTopoSystem* system, int gpu, int* retCpu
   *retCpu = localCpu;
   return ncclSuccess;
 }
-
+//，构建一条“经过中间节点（通常是CPU或GPU）”的复合路径。例如：从节点1经过CPU再到节点2，把这两段路径拼接起来，形成一条完整的路径，并更新路径的类型、带宽等属性。
+// 不过这里有点疑问，为什么没有更新节点2到节点1的路径呢？因为最优路径可能不同？
 static ncclResult_t addInterStep(struct ncclTopoSystem* system, int tx, int ix, int t1, int i1, int t2, int i2) {
   struct ncclTopoNode* cpuNode = system->nodes[tx].nodes+ix;
   struct ncclTopoNode* srcNode = system->nodes[t1].nodes+i1;
@@ -232,6 +233,7 @@ static ncclResult_t addInterStep(struct ncclTopoSystem* system, int tx, int ix, 
   // Update path characteristics
   srcNode->paths[t2][i2].count = l;
   srcNode->paths[t2][i2].type = std::max(srcNode->paths[tx][ix].type, cpuNode->paths[t2][i2].type);
+  //如果中间节点是GPU，则特殊标记为 PATH_PXN 。
   if (tx == GPU) srcNode->paths[t2][i2].type = PATH_PXN;
   srcNode->paths[t2][i2].bw = std::min(srcNode->paths[tx][ix].bw, cpuNode->paths[t2][i2].bw);
   return ncclSuccess;
@@ -291,107 +293,132 @@ ncclResult_t ncclGetLevel(int* level, const char* disableEnv, const char* levelE
 
 NCCL_PARAM(IgnoreDisabledP2p, "IGNORE_DISABLED_P2P", 0);
 
+// 用于判断两个GPU之间是否可以直接P2P通信（包括NVLink/PCIe等），并根据拓扑、环境变量、硬件状态等多重条件做出决策。
 int ncclTopoUserP2pLevel = -1;
 ncclResult_t ncclTopoCheckP2p(struct ncclComm* comm, struct ncclTopoSystem* system, int rank1, int rank2,
                               int* p2p, int *read, int* intermediateRank) {
   int mnnvl = 0;
   struct ncclPeerInfo* info1 = NULL;
   struct ncclPeerInfo* info2 = NULL;
-  *p2p = 0;
-  if (read) *read = 0;
+  *p2p = 0;// 默认不支持P2P
+  if (read) *read = 0;// 默认不支持P2P Read
   if (intermediateRank) *intermediateRank = -1;
 
   // Rule out different nodes / isolated containers
+  // 排除不同物理节点/容器的情况
   if (comm) {
     info1 = comm->peerInfo+rank1;
     info2 = comm->peerInfo+rank2;
-    if (info1->hostHash != info2->hostHash) {
+    if (info1->hostHash != info2->hostHash) {// 不同主机
       if (comm->MNNVL) {
-        NCCLCHECK(ncclTopoCheckMNNVL(comm->topo, info1, info2, &mnnvl));
-        if (!mnnvl) return ncclSuccess;
+        NCCLCHECK(ncclTopoCheckMNNVL(comm->topo, info1, info2, &mnnvl)); // 检查是否在同一NVLink Fabric
+        if (!mnnvl) return ncclSuccess;// 不在同一Fabric，直接返回, 不支持P2P。
       } else {
         return ncclSuccess;
       }
-    } else if (info1->shmDev != info2->shmDev) {
+    } else if (info1->shmDev != info2->shmDev) {// 共享内存设备不同，也不支持P2P
+      /*
+      shmDev 通常代表 GPU 所在的“共享内存设备”或“NUMA 节点”或“同一 CPU socket 下的设备”。如果两个 GPU 不属于同一个 shmDev，
+      说明它们之间即使有物理互联，操作系统层面也可能不允许直接的共享内存访问，或者性能会很差，甚至根本无法建立 P2P 通道。
+      */
       return ncclSuccess;
     }
   }
-
+// 从拓扑结构中获取两个GPU的索引
   // Get GPUs from topology
   int g1, g2;
   NCCLCHECK(ncclTopoRankToIndex(system, rank1, &g1));
   struct ncclTopoNode* gpu1 = system->nodes[GPU].nodes+g1;
   if (ncclTopoRankToIndex(system, rank2, &g2) == ncclInternalError) {
-    // GPU not found, we can't use p2p.
+    // GPU not found, we can't use p2p. // 找不到GPU，不能用P2P
     return ncclSuccess;
   }
-
+// 如果路径是两跳，且中间节点是GPU，则记录中转GPU的索引
   int intermediateIndex = -1;
   // Set intermediate GPU rank, if routing through an intermediate GPU.
   struct ncclTopoLinkList* path = gpu1->paths[GPU]+g2;
   if (path->count == 2) {
     struct ncclTopoNode* intermediateNode = path->list[0]->remNode;
-    if (intermediateNode->type == GPU) {
+    if (intermediateNode->type == GPU) {// 中间节点是GPU
       intermediateIndex = intermediateNode - system->nodes[GPU].nodes;
       if (intermediateRank) *intermediateRank = intermediateNode->gpu.rank;
     }
   }
-
+ // 默认P2P只允许跨PCIe桥（不允许跨Host Bridge/CPU）
   // By default don't use P2P across CPU Host Bridges and further apart
   int p2pLevel = PATH_PXB;
 
   int arch, vendor, model;
   NCCLCHECK(ncclTopoCpuType(system, &arch, &vendor, &model));
   // Allow P2P between pairs of GPUs on AMD systems
+  // AMD平台且只有2块GPU时，放宽P2P限制
+  // 可能是因为AMD 的部分服务器主板设计，两个 GPU 可能分别挂在不同的 CPU（NUMA 节点）下，彼此之间的直连路径必然要经过 CPU Host Bridge。
+  //在实际部署中，2块GPU很可能分别插在不同的CPU（NUMA节点）下的PCIe插槽上，这样GPU之间的P2P通信路径就必然要经过CPU Host Bridge（即跨NUMA节点）。
   if ((arch == NCCL_TOPO_CPU_ARCH_X86 && vendor == NCCL_TOPO_CPU_VENDOR_AMD) && system->nodes[GPU].count <= 2) p2pLevel = PATH_SYS;
 
-  // User override
+  // User override // 用户环境变量覆盖 初始值为 -1，表示尚未设置
   if (ncclTopoUserP2pLevel == -1)
+  //尝试从环境变量 NCCL_P2P_DISABLE 或 NCCL_P2P_LEVEL 读取用户设置的P2P等级。
+//如果环境变量没设置，或者内容非法， ncclTopoUserP2pLevel 会被设置为 -2。
     NCCLCHECK(ncclGetLevel(&ncclTopoUserP2pLevel, "NCCL_P2P_DISABLE", "NCCL_P2P_LEVEL"));
-  if (ncclTopoUserP2pLevel != -2) {
+  if (ncclTopoUserP2pLevel != -2) {//说明用户确实通过环境变量指定了P2P等级，这时就用用户指定的等级覆盖默认的 p2pLevel ，并跳到 compare 标签，直接用这个等级进行后续判断。
     p2pLevel = ncclTopoUserP2pLevel;
-    goto compare;
+    goto compare;// 跳到比较阶段
   }
 
 
 compare:
   // Compute the PCI distance and compare with the p2pLevel.
+  // 比较路径类型与p2pLevel，决定是否支持P2P
   if (path->type <= p2pLevel) *p2p = 1;
-
+//这段代码是NCCL多重保障机制中的最后一道防线，确保P2P通信既符合拓扑和策略，也符合底层硬件/驱动的实际能力，最大程度保证通信的安全和稳定。
   if (*p2p == 1) {
+    
     // NCCL_IGNORE_DISABLED_P2P=2 is used by unit tests that don't want to
     // validate against NVML at all since they are pretending to be on other hw.
+    // NCCL_IGNORE_DISABLED_P2P=2 用于单元测试，跳过NVML校验
+    //不是同一块GPU,要么没有通信上下文（comm），要么这两个GPU都在同一主机上。环境变量 NCCL_IGNORE_DISABLED_P2P 没有被设置为2（2通常用于单元测试，跳过NVML校验）。
+    //这段代码是NCCL在决定是否允许两个GPU之间P2P通信的最后一步安全检查，确保硬件和驱动层面（NVML）也支持P2P
+    //comm == NULL 的判断是为了兼容 NCCL 在没有通信上下文时的调用场景，保证代码的健壮性和通用性。此时直接允许后续的 P2P 能力检查，不做主机一致性校验。
     if (g1 != g2 && (comm == NULL || (info1->hostHash == comm->peerInfo[comm->rank].hostHash &&
                                       info1->hostHash == info2->hostHash)) && ncclParamIgnoreDisabledP2p() != 2) {
-      int indexes[3] = {-1,-1,-1};
+      int indexes[3] = {-1,-1,-1};//依次存放起点GPU、中间节点（如果有）、终点GPU的设备号。 verticeN 表示实际用到的节点数。
       int verticeN = 0;
       NCCLCHECK(ncclNvmlEnsureInitialized());
 
       indexes[verticeN++] = system->nodes[GPU].nodes[g1].gpu.dev;
       if (intermediateIndex != -1) indexes[verticeN++] = system->nodes[GPU].nodes[intermediateIndex].gpu.dev;
       indexes[verticeN++] = system->nodes[GPU].nodes[g2].gpu.dev;
-
+// 检查NVML层面P2P状态 。遍历路径上的每一段（比如A->B->C会检查A-B和B-C）
       for (int i=1; i < verticeN; i++) {
         nvmlGpuP2PStatus_t status;
+        //通过 ncclNvmlDevicePairs 查询NVML层面这两个GPU之间的P2P读写状态（ p2pStatusRead 和 p2pStatusWrite ）。
         status = ncclNvmlDevicePairs[indexes[i-1]][indexes[i-0]].p2pStatusRead;
         bool good = status == NVML_P2P_STATUS_OK;
         status = ncclNvmlDevicePairs[indexes[i-1]][indexes[i-0]].p2pStatusWrite;
-        good &= status == NVML_P2P_STATUS_OK;
-        if (!good) {
-          if (!ncclParamIgnoreDisabledP2p()) {
+        good &= status == NVML_P2P_STATUS_OK;//只有读写都为 NVML_P2P_STATUS_OK ，才认为这段P2P是可用的。
+        if (!good) {//如果NVML报告P2P不可用（ good == false ）
+          if (!ncclParamIgnoreDisabledP2p()) {//如果不强制忽略NVML的P2P禁用
             if (path->type <= PATH_NVB) {
+              //说明本应支持P2P但被禁用
               WARN("P2P is disabled between NVLINK connected GPUs %d and %d. This should not be the case given their connectivity, and is probably due to a hardware issue. If you still want to proceed, you can set NCCL_IGNORE_DISABLED_P2P=1.", indexes[i-1], indexes[i-0]);
               return ncclUnhandledCudaError;
             } else if (path->type < PATH_SYS) {
               INFO(NCCL_INIT, "P2P is disabled between connected GPUs %d and %d. You can repress this message with NCCL_IGNORE_DISABLED_P2P=1.", indexes[i-1], indexes[i-0]);
             }
           }
-          *p2p = 0;
+          *p2p = 0;// NVML不支持P2P，最终不允许
         }
       }
     }
   }
+  // 如果是NVLink直连，且两块GPU都是Ampere架构，允许P2P Read
+  /*
+  - 因为P2P Write的兼容性和性能在绝大多数平台上都更好、更稳定，是NCCL默认优先支持的方式。
+- P2P Read只有在特定平台（如Ampere+NVLink）才被认为是安全且高效的，NCCL会做更严格的判断，只有满足条件才允许开启。
+在硬件实现和驱动支持上，P2P Write 通常比 P2P Read 更容易实现和优化。很多早期的NVIDIA GPU和主板/驱动只支持P2P Write，不支持P2P Read，或者P2P Read性能很差。
 
+  */
   if (path->type == PATH_NVL) {
     struct ncclTopoNode* gpu2 = system->nodes[GPU].nodes+g2;
     // Enable P2P Read for Ampere/NVLink only
@@ -420,7 +447,7 @@ ncclResult_t ncclTopoCheckMNNVL(struct ncclTopoSystem* system, struct ncclPeerIn
 
 NCCL_PARAM(NetGdrRead, "NET_GDR_READ", -2);
 int ncclTopoUserGdrLevel = -1;
-
+//
 ncclResult_t ncclTopoCheckGdr(struct ncclTopoSystem* system, int rank, int64_t netId, int read, int* useGdr) {
   *useGdr = 0;
 
@@ -579,9 +606,15 @@ NCCL_PARAM(PxnDisable, "PXN_DISABLE", 0);
 
 // Net v4 plugins don't have non-blocking connect/accept. We can't therefore use
 // remote proxies without risking deadlocks
+// 该函数用于判断 NCCL 是否需要禁用 PXN（Proxy NIC，中转网卡）功能，并返回禁用标志。
+// PXN 是 NCCL 在多机多卡通信中，为了优化 GPU 到 NIC 的路径而引入的一种“通过中转 GPU 访问 NIC”的机制
 int ncclPxnDisable(struct ncclComm* comm) {
   static int pxnDisable = -1;
   if (pxnDisable == -1) {
+    /*
+    如果通信上下文存在，并且网络插件版本为4（v4），则强制禁用 PXN。
+     原因是 v4 版本的网络插件 不支持非阻塞的 connect/accept ，如果启用 PXN 可能导致死锁（deadlock），所以直接禁用，并打印日志。
+    */
     if (comm && ncclNetVersion(comm) == 4) {
       INFO(NCCL_INIT, "PXN Disabled as plugin is v4");
       pxnDisable = 1;
@@ -632,26 +665,26 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
   ncclTopoRemovePaths(system);
 
   // Set direct paths to CPUs. We need them in many cases.
-  // 2. 为每个 CPU 节点设置到其它 CPU 节点的直接路径
+  // 2. 为每个 CPU 节点设置其它节点到它的路径
   for (int c=0; c<system->nodes[CPU].count; c++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[CPU].nodes+c, system));
   }
- // 3. 为每个 GPU 节点设置到其它 GPU 节点的直接路径
+ // 3. 为每个 GPU 节点设置到其它 GPU 节点到他路径
   // Set direct paths to GPUs.
   for (int g=0; g<system->nodes[GPU].count; g++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[GPU].nodes+g, system));
   }
-// 4. 为每个 NIC 节点设置到其它 NIC 节点的直接路径
+// 为系统中每一个网络接口（NIC）节点预先计算并存储所有节点到它的最优通信路径
   // Set direct paths to NICs.
   for (int n=0; n<system->nodes[NET].count; n++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[NET].nodes+n, system));
   }
-// 5. 为每个 NVSwitch 节点设置到其它 NVSwitch 节点的直接路径
+// 5. 为每个 NVSwitch 节点设置到其它 节点的最优路径
   // Set direct paths to NVSwitches.
   for (int n=0; n<system->nodes[NVS].count; n++) {
     NCCLCHECK(ncclTopoSetPaths(system->nodes[NVS].nodes+n, system));
   }
-// 6. 处理 GPU 间 P2P 不可用的情况，将流量绕行 CPU
+// 6. 处理 GPU 间 P2P 不可用的情况，将流量绕行 CPU。如果p2p不可用，则首先增加cpu绕行、
   // Update path for GPUs when we don't want to / can't use GPU Direct P2P
   for (int g=0; g<system->nodes[GPU].count; g++) {
     for (int p=0; p<system->nodes[GPU].count; p++) {
@@ -662,13 +695,13 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
         // Divert all traffic through the CPU
         // 如果 GPU p 到 GPU g 之间 P2P 不可用，则通过本地 CPU 绕行
         int cpu;
-        NCCLCHECK(ncclGetLocalCpu(system, g, &cpu));
+        NCCLCHECK(ncclGetLocalCpu(system, g, &cpu));//找到距离g最近的cpu
         NCCLCHECK(addInterStep(system, CPU, cpu, GPU, p, GPU, g));
       }
     }
-
+    //comm为NULL时，无法获取peerInfo等通信相关信息，也就无法判断P2P和SHM的可达性，继续执行会导致空指针或无意义的判断。
     if (comm == NULL) continue;
-        // 7. 标记完全不可达的 GPU 对（P2P 和 SHM 都不可用），后续会被修剪
+    // 标记那些既不能通过P2P（Peer-to-Peer）也不能通过SHM（共享内存）通信的GPU对 ，为后续的路径修剪做准备。
     // Remove GPUs we can't (or don't want to) communicate with through P2P or SHM
     struct ncclPeerInfo* dstInfo = comm->peerInfo+system->nodes[GPU].nodes[g].gpu.rank;
     for (int p=0; p<system->nodes[GPU].count; p++) {
@@ -681,7 +714,7 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
         NCCLCHECK(ncclTransports[TRANSPORT_SHM]->canConnect(&shm, comm, NULL, srcInfo, dstInfo));
         if (shm == 0) {
           // Mark this peer as inaccessible. We'll trim it later.
-          // 标记该路径只能通过网络通信
+          // 标记该p到g的路径只能通过网络通信
           system->nodes[GPU].nodes[p].paths[GPU][g].type = PATH_NET;
         }
       }
@@ -695,13 +728,17 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
       // 8.1 检查是否可以通过其他 NVLink 连接的 GPU 中转访问 NIC（PXN）
     for (int g=0; g<system->nodes[GPU].count; g++) {
       // Check whether we can access the NIC through another NVLink-connected GPU (PXN)
+      /*
+      - 某些情况下，直接从当前 GPU 到目标网卡的路径带宽较低，或者路径类型不理想（比如需要经过 CPU Host Bridge，带宽低、延迟高）。
+- 但如果先通过 NVLink 到另一个 GPU（peerNode），再由该 GPU 通过 PCIe 访问网卡，可能能获得更高的带宽或更优的路径类型（比如避免经过 CPU）。
+      */
       struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
-      if (ncclPxnDisable(comm) != 1) {
+      if (ncclPxnDisable(comm) != 1) {//如果没有禁用PXN功能
         int localGpuIndex;
-        NCCLCHECK(ncclTopoGetLocalGpu(system, netNode->id, &localGpuIndex));
-        if (localGpuIndex != g && localGpuIndex != -1) {
+        NCCLCHECK(ncclTopoGetLocalGpu(system, netNode->id, &localGpuIndex));//查找与当前 net（netNode）相连 GPU（localGpuIndex）
+        if (localGpuIndex != g && localGpuIndex != -1) {//如果当前遍历的 GPU（g）不是搜索到的该net连接的GPU，并且确实找到了直连 GPU，才继续。
           // PXN = PCI + NVLink.
-          struct ncclTopoNode* peerNode = system->nodes[GPU].nodes+localGpuIndex;
+          struct ncclTopoNode* peerNode = system->nodes[GPU].nodes+localGpuIndex;//获取连接该 NIC 的 GPU 节点指针
           // Only use PXN for NIC n if remote GPU p ...
           if (peerNode->paths[NET][n].type <= PATH_PXB && // Is connected to the NIC through PCI
               peerNode->paths[GPU][g].type <= PATH_NVL && // Is connected to us through NVLink
@@ -710,12 +747,24 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
                gpu->paths[NET][n].type > PATH_PXB))                  // or avoids going through a CPU
           // We can use that GPU as relay to communicate with that NIC.
           // Only enabling it in the GPU->NIC direction for now to favor
-          // receiving locally and sending remotely (consistent with net.cc)
+          // receiving locally and sending remotely (consistent with net.cc) 明确说明只做单向补全。
           // 通过 peerNode GPU 中转访问 NIC，优化带宽或避免经过 CPU
+          /*
+          AI解释的这里没有反向的原因是：
+          - PXN 的主要目的是 提升 GPU 发送到 NET 的带宽 或优化路径类型（比如避免经过 CPU）。
+          - 而 NET → GPU（即接收数据）时，通常还是希望数据直接到达本地 GPU，避免多余的中转和带宽损失。
+          - 所以只需要补全 GPU → NET 这一个方向。
+          -英文注释说明了是为了consistent with net.cc
+          */
           NCCLCHECK(addInterStep(system, GPU, localGpuIndex, GPU, g, NET, n));
         }
       }
        // 8.2 如果 GPU 到 NIC 路径类型优于 PHB，检查 GDR 能力
+       /*
+       当 GPU 到 NIC（网卡）的路径类型优于 PHB（即不需要经过 CPU Host Bridge，通常是 PCIe 直连或多级 PCIe Switch），说明 GPU 到 NIC 的路径类型比 PHB 更优（比如 PCIe 直连），理论上可以用 GDR。
+       但实际检测发现该路径不支持 GDR（GPU Direct RDMA）时，NCCL 会强制让数据流量绕行本地 CPU，即通过 CPU 作为中转节点来访问网卡。
+       GDR（GPU Direct RDMA，GPU Direct Remote Direct Memory Access）是一种由 NVIDIA 推出的技术，允许网络设备（如高性能网卡）直接访问 GPU 显存（显存即 GPU 的内存），实现数据在 GPU 和网卡之间的直接传输，无需经过主机 CPU 的内存中转。 
+       */
       if (gpu->paths[NET][n].type < PATH_PHB) {
         // Update path when we dont want to / can't use GPU Direct RDMA.
         int gdr;
@@ -724,6 +773,7 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
           // We cannot use GPU Direct RDMA, divert all traffic through the CPU local to the GPU
           int localCpu;
           NCCLCHECK(ncclGetLocalCpu(system, g, &localCpu));
+          //这里却双向了。
           NCCLCHECK(addInterStep(system, CPU, localCpu, NET, n, GPU, g));
           NCCLCHECK(addInterStep(system, CPU, localCpu, GPU, g, NET, n));
         }

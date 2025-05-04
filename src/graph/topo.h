@@ -69,7 +69,7 @@ extern const char* topoLinkTypeStr[];//连接类型字符串数组声明。
 #define PATH_PXB 4
 
 // Connection between a GPU and a NIC using an intermediate GPU. Used to enable rail-local, aggregated network send/recv operations.
-//GPU与NIC间通过中间GPU的路径类型编号
+//GPU 和 NIC（网络接口卡）之间通过中间 GPU 连接的路径
 #define PATH_PXN 5
 
 // Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU) 经过PCIe主桥（通常是CPU）的路径类型编号

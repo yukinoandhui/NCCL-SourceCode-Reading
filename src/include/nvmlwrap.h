@@ -90,16 +90,16 @@ typedef struct nvmlPciInfo_st
     unsigned int reserved3;
 } nvmlPciInfo_t;
 
-/* P2P Capability Index Status*/
+/* P2P Capability Index Status 用于表示两个GPU之间P2P（Peer-to-Peer）通信能力的状态*/
 typedef enum nvmlGpuP2PStatus_enum
 {
-    NVML_P2P_STATUS_OK     = 0,
-    NVML_P2P_STATUS_CHIPSET_NOT_SUPPORED,
-    NVML_P2P_STATUS_GPU_NOT_SUPPORTED,
-    NVML_P2P_STATUS_IOH_TOPOLOGY_NOT_SUPPORTED,
-    NVML_P2P_STATUS_DISABLED_BY_REGKEY,
-    NVML_P2P_STATUS_NOT_SUPPORTED,
-    NVML_P2P_STATUS_UNKNOWN
+    NVML_P2P_STATUS_OK     = 0,//P2P通信支持正常，可以直接进行P2P操作
+    NVML_P2P_STATUS_CHIPSET_NOT_SUPPORED,//主板芯片组不支持P2P通信
+    NVML_P2P_STATUS_GPU_NOT_SUPPORTED,//某一方GPU不支持P2P通信。
+    NVML_P2P_STATUS_IOH_TOPOLOGY_NOT_SUPPORTED,//IOH（I/O Hub）拓扑结构不支持P2P通信。
+    NVML_P2P_STATUS_DISABLED_BY_REGKEY,//通过注册表（或驱动配置）被禁用了P2P功能。
+    NVML_P2P_STATUS_NOT_SUPPORTED,//不支持P2P通信（其他原因）
+    NVML_P2P_STATUS_UNKNOWN//P2P状态未知，无法判断。
 } nvmlGpuP2PStatus_t;
 
 /* P2P Capability Index*/
