@@ -34,7 +34,7 @@
 #define NCCL_TOPO_NODE_TYPES 6 //拓扑节点类型总数为6。
 #define GPU 0//GPU节点类型编号。
 #define PCI 1//PCI节点类型编号
-#define NVS 2//NVSwitch节点类型编号
+#define NVS 2// NVSwitch节点类型编号
 #define CPU 3 // Actually NUMA domains CPU节点类型编号（实际为NUMA域）。
 #define NIC 4 //网络接口卡（NIC）节点类型编号。
 #define NET 5 //网络节点类型编号。
@@ -175,7 +175,7 @@ struct ncclTopoSystem {
 
 ncclResult_t ncclTopoGetNode(struct ncclTopoSystem* system, struct ncclTopoNode** node, int type, uint64_t id);
 ncclResult_t ncclTopoCreateNode(struct ncclTopoSystem* system, struct ncclTopoNode** node, int type, uint64_t id);
-ncclResult_t ncclTopoRemoveNode(struct ncclTopoSystem* system, int type, int id);
+ncclResult_t ncclTopoRemoveNode(struct ncclTopoSystem* system, int type, int id);//这里id应该改成index
 ncclResult_t ncclTopoConnectNodes(struct ncclTopoNode* node, struct ncclTopoNode* remNode, int type, float bw);
 ncclResult_t ncclTopoPrintPaths(struct ncclTopoSystem* system);
 ncclResult_t ncclTopoLoadSystem(const char* xmlTopoFile, struct ncclTopoSystem* system);

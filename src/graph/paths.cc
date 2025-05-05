@@ -447,7 +447,7 @@ ncclResult_t ncclTopoCheckMNNVL(struct ncclTopoSystem* system, struct ncclPeerIn
 
 NCCL_PARAM(NetGdrRead, "NET_GDR_READ", -2);
 int ncclTopoUserGdrLevel = -1;
-//
+//用于判断某个 GPU 和某个网卡（NET）之间是否可以启用 GDR（GPU Direct RDMA），即网卡能否直接访问 GPU 显存进行高效数据传输。
 ncclResult_t ncclTopoCheckGdr(struct ncclTopoSystem* system, int rank, int64_t netId, int read, int* useGdr) {
   *useGdr = 0;
 
@@ -458,22 +458,26 @@ ncclResult_t ncclTopoCheckGdr(struct ncclTopoSystem* system, int rank, int64_t n
   NCCLCHECK(ncclTopoRankToIndex(system, rank, &g));
   struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
 
-  // Check that both the NIC and GPUs support it
+  // Check that both the NIC and GPUs support it 如果网卡或 GPU 本身不支持 GDR，直接返回
   if (net->net.gdrSupport == 0) return ncclSuccess;
   if (gpu->gpu.gdrSupport == 0) return ncclSuccess;
-
+  //如果是 GDR Read（即网卡向 GPU 读数据）
   if (read) { // For reads (sends) only enable under certain conditions
     int gdrReadParam = ncclParamNetGdrRead();
     if (gdrReadParam == 0) return ncclSuccess;
     // Disable GDR Reads pre-Ampere when we have other PCI flows
+    // 对于 Ampere 之前的 GPU（算力 < 80），如果没有 NVLink 直连，禁用 GDR Read（因为性能不佳或不稳定）。
     if (gdrReadParam < 0 && gpu->gpu.cudaCompCap < 80) {
       int nvlink = 0;
       // Since we don't know whether there are other communicators,
       // it's better to keep things local if we have a single GPU.
-      if (system->nodes[GPU].count == 1) nvlink = 1;
+      // 由于我们无法确定系统中是否还存在其他通信器（communicator，NCCL 的通信上下文），
+      // 如果当前只有一块 GPU，最好让所有操作都局限在本地（local），即只在这块 GPU 上进行，不要尝试跨设备或跨节点通信。
+      if (system->nodes[GPU].count == 1) nvlink = 1; //如果系统中只有一块 GPU，则直接认为“有 NVLink 直连”，即允许本地 GDR Read。
       for (int i=0; i<system->nodes[GPU].count; i++) {
         if (i == g) continue;
-        if (gpu->paths[GPU][i].type == PATH_NVL) {
+        //这里的 NVLink 检查其实是 NCCL 用来“推测”平台整体互联和 GDR 能力的一个“信号”。有 NVLink 说明平台较新、互联好，GDR Read 风险小，所以允许；否则就禁用。
+        if (gpu->paths[GPU][i].type == PATH_NVL) { //如果有多块 GPU，遍历所有其他 GPU，检查当前 GPU 是否与其他 GPU 之间存在 NVLink 直连
           nvlink = 1;
           break;
         }
@@ -481,13 +485,14 @@ ncclResult_t ncclTopoCheckGdr(struct ncclTopoSystem* system, int rank, int64_t n
       if (!nvlink) return ncclSuccess;
     }
   }
-
-  // Check if we are close enough that it makes sense to enable GDR
-  int netGdrLevel = PATH_PXB;
+  //检查距离限制
+  // Check if we are close enough that it makes sense to enable GDR 
+  int netGdrLevel = PATH_PXB;//默认只允许距离不超过 PATH_PXB（PCIe Switch 直连）的路径使用 GDR。
+  //用户可以通过环境变量 NCCL_NET_GDR_LEVEL 覆盖默认距离限制。
   NCCLCHECK(ncclGetLevel(&ncclTopoUserGdrLevel, NULL, "NCCL_NET_GDR_LEVEL"));
   if (ncclTopoUserGdrLevel != -2) netGdrLevel = ncclTopoUserGdrLevel;
   int distance = gpu->paths[NET][n].type;
-  if (distance == PATH_PXN) {
+  if (distance == PATH_PXN) {//如果路径类型为 PXN（即通过 peer GPU 中转），则用中转 GPU 到网卡的距离重新判断。
     // In case of PXN, use the intermediate GPU distance instead
     int proxyRank, g;
     NCCLCHECK(ncclTopoGetIntermediateRank(system, gpu->gpu.rank, netId, &proxyRank));
@@ -576,7 +581,7 @@ ncclResult_t ncclTopoCheckNet(struct ncclTopoSystem* system, int rank1, int rank
   *net = 0;
   return ncclSuccess;
 }
-
+//获取中转gpu
 ncclResult_t ncclTopoGetIntermediateRank(struct ncclTopoSystem* system, int rank, int64_t netId, int* intermediateRank) {
   // Get GPU and NET
   int n, g;
@@ -591,6 +596,7 @@ ncclResult_t ncclTopoGetIntermediateRank(struct ncclTopoSystem* system, int rank
       node = path->list[i]->remNode;
       type = node->type;
     }
+    //遍历路径的每一跳，找到第一个类型为 GPU 的节点（即中转 GPU）。
     if (type != GPU) {
       WARN("Could not find intermediate GPU between GPU rank %d and NIC %lx", rank, netId);
       return ncclInternalError;
@@ -782,31 +788,35 @@ ncclResult_t ncclTopoComputePaths(struct ncclTopoSystem* system, struct ncclComm
   }
   return ncclSuccess;
 }
-
+// 根据当前通信域（comm）和 GPU 拓扑，把不属于本通信域的 GPU 节点从系统拓扑中移除，保证后续 NCCL 通信只在本域内的 GPU 之间进行。
+// 如果所有 GPU 都属于本通信域，则把所有 NET（网络）节点也移除。
 ncclResult_t ncclTopoTrimSystem(struct ncclTopoSystem* system, struct ncclComm* comm) {
   ncclResult_t ret = ncclSuccess;
-  int *domains;
-  int64_t *ids = NULL;
-  int myDomain = 0;
-  int ngpus = system->nodes[GPU].count;
+  int *domains;//记录每个 GPU 所属的“域”
+  int64_t *ids = NULL;//：记录每个 GPU 的唯一 id。
+  int myDomain = 0;//当前进程所属 GPU 的域编号。
+  int ngpus = system->nodes[GPU].count;//当前系统中的 GPU 数量。
   NCCLCHECK(ncclCalloc(&domains, system->nodes[GPU].count));
   NCCLCHECKGOTO(ncclCalloc(&ids, system->nodes[GPU].count), ret, fail);
-  for (int g=0; g<system->nodes[GPU].count; g++) {
+  for (int g=0; g<system->nodes[GPU].count; g++) {//外层循环遍历所有 GPU。
     struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
-    domains[g] = g;
+    domains[g] = g;//初始时每个 GPU 自成一个域
     ids[g] = gpu->id;
-    for (int p=0; p<g; p++) {
+    for (int p=0; p<g; p++) {//如果当前 GPU 到前面某个 GPU 的路径类型 < PATH_NET （即不是通过网络连接，而是本地互联，如 NVLink、PCIe），则把它们归为同一个域（取最小的域编号）。
       if (gpu->paths[GPU][p].type < PATH_NET) {
         domains[g] = std::min(domains[g], domains[p]);
       }
     }
-    if (gpu->gpu.rank == comm->rank) myDomain = domains[g];
+    if (gpu->gpu.rank == comm->rank) myDomain = domains[g];//如果当前 GPU 的 rank 等于通信域的 rank，则记录下它的域编号
   }
-
+//遍历所有 GPU，如果其域编号不是 myDomain ，则将其从系统拓扑中移除。
   for (int i=0; i<ngpus; i++) {
     if (domains[i] == myDomain) continue;
     struct ncclTopoNode* gpu = NULL;
     int g;
+    //通过 id 在当前 GPU 节点数组中查找对应的 GPU 节点指
+    //因为在前面的逻辑中， ids 数组保存了原始 GPU 节点的 id，但由于可能有节点被移除，节点数组的顺序和内容可能发生变化，所以需要通过 id 再次定位到当前系统中的对应节点。
+    //这里system->nodes[GPU].count 是会变化的。
     for (g=0; g<system->nodes[GPU].count /* This one varies over the loops */; g++) {
       gpu = system->nodes[GPU].nodes+g;
       if (gpu->id == ids[i]) break; else gpu=NULL;
@@ -816,9 +826,11 @@ ncclResult_t ncclTopoTrimSystem(struct ncclTopoSystem* system, struct ncclComm* 
       ret = ncclInternalError;
       goto fail;
     }
+    //通过 id 查找对应的 GPU 节点的坐标，调用 ncclTopoRemoveNode 移除。
     NCCLCHECKGOTO(ncclTopoRemoveNode(system, GPU, g), ret, fail);
   }
-
+  //如果剩下的 GPU 数量等于通信域的总 rank 数，说明所有 GPU 都属于本域，这时可以把所有 NET 节点（网络节点）也移除。
+  //如果有 GPU 被移除，说明通信域内的 GPU 不是全部本地的，可能还需要通过网络与其他节点通信，所以不能移除网络节点。
   if (system->nodes[GPU].count == comm->nRanks) {
     for (int n=system->nodes[NET].count-1; n>=0; n--)
       NCCLCHECKGOTO(ncclTopoRemoveNode(system, NET, n), ret, fail);

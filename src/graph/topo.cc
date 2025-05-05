@@ -131,7 +131,8 @@ ncclResult_t ncclTopoCreateNode(struct ncclTopoSystem* system, struct ncclTopoNo
   *node = n;
   return ncclSuccess;
 }
-
+//删除节点。path是直接free掉了，主要是删除link，这样后续可以重新计算path。
+//具体来说就是删除了remoteNode是指定节点的link（边），然后把相关link数组前移。然后把所有跟被删除节点一个类型并且地址高于被删除节点的节点地址减一。
 ncclResult_t ncclTopoRemoveNode(struct ncclTopoSystem* system, int type, int index) {
   struct ncclTopoNode* delNode = system->nodes[type].nodes+index;
   for (int t=0; t<NCCL_TOPO_NODE_TYPES; t++) {
@@ -139,17 +140,23 @@ ncclResult_t ncclTopoRemoveNode(struct ncclTopoSystem* system, int type, int ind
     for (int n=0; n<system->nodes[t].count; n++) {
       struct ncclTopoNode* node = system->nodes[t].nodes+n;
       if (node == delNode) continue;
+      //对所有类型的节点，遍历每个节点的所有连接（links）
       for (int l=0; l<node->nlinks; l++) {
+        //如果发现有指向被删节点的连接（remNode == delNode），就用 memmove 把后面的连接前移，nlinks 数减一，实现删除。
         while (l<node->nlinks && node->links[l].remNode == delNode) {
           memmove(node->links+l, node->links+l+1, (node->nlinks-l-1)*sizeof(struct ncclTopoLink));
           node->nlinks--;
         }
+        //如果连接指向的节点类型和被删节点类型相同，且 remNode 地址大于等于 delNode，说明后续节点在数组中会整体前移一位，所以 remNode 指针也要减一，保持正确指向。
+        //因为我们删除的节点其实是数组中的一个空位，而前面memove是把link数组进行了迁移。所以删除后数组中会有一个空位，需要整体前移。
+        //注意这里是判断的所有类型的节点的所有边，所以只要有边的指向节点和被删除节点类型相同，且是高位地址，就需要减一。（因为node创建的时候其实是个数组）
         if (l<node->nlinks && node->links[l].remNode->type == type && node->links[l].remNode >= delNode) {
-          node->links[l].remNode--;
+          node->links[l].remNode--;//调整指针
         }
       }
     }
   }
+  //用 memmove 把被删节点后面的所有节点整体前移一位，覆盖被删节点，实现数组紧凑化。
   memmove(delNode, delNode+1, (system->nodes[type].count-index-1)*sizeof(struct ncclTopoNode));
   system->nodes[type].count--;
   return ncclSuccess;

@@ -830,11 +830,11 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoGetSystem(comm, &comm->topo), ret, fail);
   // Compute paths between GPUs and NICs 计算 GPU 与 NIC 之间的路径。
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
-  // Remove inaccessible GPUs and unused NICs 移除不可达的 GPU 和未使用的 NIC。
+  // Remove inaccessible GPUs and unused NICs 移除不可达的 GPU 和未使用的 NIC。（主要是删除非本地通信域的gpu、网卡）
   NCCLCHECKGOTO(ncclTopoTrimSystem(comm->topo, comm), ret, fail);
   // Recompute paths after trimming 再次计算路径，确保拓扑信息准确。
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
-  // Init search 初始化拓扑搜索结构
+  // Init search 初始化拓扑搜索结构，其实主要是设置一下系统的带宽，单个节点的最大带宽，和路径的最大带宽。
   NCCLCHECKGOTO(ncclTopoSearchInit(comm->topo), ret, fail);
   // Decide on comm's CPU architecture. 计算并设置通信器的 CPU 架构信息。
   NCCLCHECKGOTO(ncclTopoComputeCommCPU(comm), ret, fail);

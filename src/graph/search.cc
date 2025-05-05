@@ -15,7 +15,8 @@
 NCCL_PARAM(CrossNic, "CROSS_NIC", 2);
 
 // Initialize system->maxBw. This is the per-channel (i.e. per-SM)
-// max bw.
+// max bw. 
+// 获取gpu到指定类型的node的所有路径中的最大带宽。
 static float getMaxBw(struct ncclTopoSystem* system, struct ncclTopoNode* gpu, int type) {
   float maxBw = 0.0;
   for (int i=0; i<system->nodes[type].count; i++) {
@@ -26,6 +27,7 @@ static float getMaxBw(struct ncclTopoSystem* system, struct ncclTopoNode* gpu, i
   }
   return maxBw;
 }
+//返回单个gpu的总带宽，即PCI带宽或NVLink带宽的较大值。
 static float getTotalBw(struct ncclTopoSystem* system, struct ncclTopoNode* gpu) {
   float nvlinkBw = 0.0, pciBw = 0.0;
   for (int l=0; l<gpu->nlinks; l++) {
@@ -35,26 +37,31 @@ static float getTotalBw(struct ncclTopoSystem* system, struct ncclTopoNode* gpu)
   }
   return std::max(pciBw, nvlinkBw);
 }
+//初始化 NCCL 拓扑系统的带宽信息，为后续通信模式选择和调度提供基础数据。
 ncclResult_t ncclTopoSearchInit(struct ncclTopoSystem* system) {
   system->maxBw = 0.0;
   system->totalBw = 0.0;
   int inter = system->nodes[NET].count;
+  //如果没有网络节点，并且只有一张GPU，说明是单卡、无网络的极简场景。
   if (inter == 0 && system->nodes[GPU].count == 1) {
     system->maxBw = LOC_BW;
     system->totalBw = LOC_BW;
     return ncclSuccess;
   }
+  //遍历所有GPU节点，分别计算每张GPU的最大带宽和总带宽。
   for (int g=0; g<system->nodes[GPU].count; g++) {
     struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
+    //如果有网络节点，则计算GPU到网络的最大带宽，否则计算GPU到其他GPU的最大带宽。节点内 GPU 之间的 NVLink/PCIe 带宽通常远高于网卡带宽
     system->maxBw = std::max(system->maxBw, getMaxBw(system, gpu, inter ? NET : GPU));
-    system->totalBw = std::max(system->totalBw, getTotalBw(system, gpu));
+    system->totalBw = std::max(system->totalBw, getTotalBw(system, gpu));//这个是考虑每张GPU的PCI带宽和NVLink带宽的较大值。
+    //而maxBw是路径中的最大带宽（与单个节点不同）
   }
   return ncclSuccess;
 }
 
 ncclResult_t ncclTopoComputeCommCPU(struct ncclComm* comm) {
   // We assume there is at least one CPU and that the CPUs have the same
-  // architecture and vendor.
+  // architecture and vendor. 我们假设至少存在一个CPU，并且所有CPU具有相同的架构和厂商
   const struct ncclTopoNodeSet* cpus = &comm->topo->nodes[CPU];
   comm->cpuArch = cpus->nodes[0].cpu.arch;
   comm->cpuVendor = cpus->nodes[0].cpu.vendor;
