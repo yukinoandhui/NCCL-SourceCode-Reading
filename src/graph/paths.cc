@@ -943,7 +943,7 @@ ncclResult_t ncclTopoGetNvbGpus(struct ncclTopoSystem* system, int rank, int* nr
   *nranks = nvbGpus;
   return ncclSuccess;
 }
-
+//获取gpu到指定类型的node的通信路径的最小路径类型
 ncclResult_t ncclTopoGetGpuMinPath(struct ncclTopoSystem* system, int type, int* min) {
   int minPath = PATH_SYS;
   for (int i=0; i<system->nodes[GPU].count; i++) {

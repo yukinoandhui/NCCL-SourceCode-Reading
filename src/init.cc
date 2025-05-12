@@ -679,7 +679,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int rank = comm->rank;
   int nranks = comm->nRanks;
   int nNodes = 1;//表示 当前通信组（uniqueId）中涉及到的物理节点（主机）数量 。
-  cpu_set_t affinitySave; //CPU亲和性
+  cpu_set_t affinitySave; //当前进程的CPU亲和性
   struct ncclTopoGraph* ringGraph = &comm->graphs[NCCL_ALGO_RING];
   struct ncclTopoGraph* treeGraph = &comm->graphs[NCCL_ALGO_TREE];
   struct ncclTopoGraph* collNetChainGraph = &comm->graphs[NCCL_ALGO_COLLNET_CHAIN];
@@ -843,7 +843,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   timers[TIMER_INIT_TOPO] = clockNano() - timers[TIMER_INIT_TOPO];
 
   // Set Affinity to a CPU local the our GPU, so that all memory we allocate
-  // on the host is local.
+  // on the host is local. 这段代码的目的是 将当前线程的 CPU 亲和性（affinity）设置为靠近本 GPU 的 CPU ，以便后续在主机端分配的内存（如 pinned memory）
+  // 尽量分配在与本 GPU 物理距离最近的 NUMA 节点上，从而提升主机到 GPU 的数据传输效率。
   NCCLCHECKGOTO(ncclTopoGetCpuAffinity(comm->topo, comm->rank, &comm->cpuAffinity), ret, fail);
   if (CPU_COUNT(&comm->cpuAffinity)) {
     sched_getaffinity(0, sizeof(cpu_set_t), &affinitySave);
@@ -861,16 +862,17 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     }
   }
 
-  // Determine local Nvls support
+  // Determine local Nvls support  初始化NVLink SHARP (NVLS)
   NCCLCHECK(ncclNvlsInit(comm));
 
   timers[TIMER_INIT_GRAPHS] = clockNano();
-  // Get rings and trees
+  // Get rings and trees 初始化通信拓扑图
   memset(ringGraph, 0, sizeof(struct ncclTopoGraph));
-  ringGraph->id = 0;
-  ringGraph->pattern = NCCL_TOPO_PATTERN_RING;
+  ringGraph->id = 0;//拓扑图的类型
+  ringGraph->pattern = NCCL_TOPO_PATTERN_RING; //Ring通信 模式
   ringGraph->minChannels = 1;
-  ringGraph->maxChannels = MAXCHANNELS/2;
+  ringGraph->maxChannels = MAXCHANNELS/2;//设定最小/最大通道数。
+  //调用 ncclTopoCompute 计算拓扑， ncclTopoPrintGraph 打印拓扑信息
   NCCLCHECKGOTO(ncclTopoCompute(comm->topo, ringGraph), ret, fail);
   NCCLCHECKGOTO(ncclTopoPrintGraph(comm->topo, ringGraph), ret, fail);
 

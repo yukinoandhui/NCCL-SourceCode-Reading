@@ -1601,7 +1601,7 @@ ncclResult_t getLocalNetCountByBw(struct ncclTopoSystem* system, int gpu, int *c
 
   return ncclSuccess;
 }
-//作用是根据 GPU 的 rank 和 channelId，查找该 GPU 在该通道下直连的 NET 节点，并且考虑了负载均衡。
+//作用是根据 GPU 的 rank 和 channelId，查找该 GPU 在该通道下直连的 NET 节点（最优的，如果到多个net的路径带宽都相同（路径类型也相同，那么就都选其中一个）），并且考虑了负载均衡。
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int64_t* id, int* dev) {
   int gpu;
   NCCLCHECK(ncclTopoRankToIndex(system, rank, &gpu));
@@ -1630,7 +1630,7 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
   if (dev) *dev = system->nodes[NET].nodes[localNets[net%localNetCount]].net.dev;
   return ncclSuccess;
 }
-//获取与net相连的gpu
+//获取与net相连的gpu（最优的那个，如果多个，返回一个就行）
 ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int64_t netId, int* gpuIndex) {
   ncclResult_t ret = ncclSuccess;
   int netIndex;
@@ -1673,7 +1673,7 @@ ncclResult_t ncclTopoCpuType(struct ncclTopoSystem* system, int* arch, int* vend
 }
 
 NCCL_PARAM(IgnoreCpuAffinity, "IGNORE_CPU_AFFINITY", 0);
-
+//根据进程的亲和性和numa节点的cpu core亲和性进行综合设置。
 ncclResult_t ncclTopoGetCpuAffinity(struct ncclTopoSystem* system, int rank, cpu_set_t* affinity) {
   struct ncclTopoNode* cpu = NULL, *gpu = NULL;
   int gpuIndex, cpuIndex;
@@ -1683,9 +1683,10 @@ ncclResult_t ncclTopoGetCpuAffinity(struct ncclTopoSystem* system, int rank, cpu
   cpu = system->nodes[CPU].nodes+cpuIndex;
 
   // Query the CPU affinity set we were provided
-  cpu_set_t mask;
+  cpu_set_t mask; 
+  // 0代表当前进程 获取当前进程的 CPU 亲和性掩码（mask），即当前允许运行在哪些 CPU 上。
   SYSCHECK(sched_getaffinity(0, sizeof(cpu_set_t), &mask), "sched_getaffinity");
-
+ // 如果开启了 TRACE，会打印当前进程的 CPU 亲和性掩码。
 #ifdef ENABLE_TRACE
   {
     char affinityStr[sizeof(cpu_set_t)*2];
@@ -1695,6 +1696,11 @@ ncclResult_t ncclTopoGetCpuAffinity(struct ncclTopoSystem* system, int rank, cpu
 #endif
 
   // Get the affinity of the CPU close to our GPU.
+  //获取与该 GPU 物理上最近的 CPU 节点的 affinity 掩码（cpuMask）。
+  //这里的“靠近 GPU 的 CPU 掩码”不是指进程当前的亲和性，而是 通过硬件拓扑分析，
+  // 找出与某个 GPU 物理距离最近的 CPU（通常是同一个 NUMA 节点下的 CPU） ，然后把这些 CPU core 的编号填到一个掩码里
+  // cpu.affinity是在初始化xml结点的时候设置的，是读取的/sys/devices/system/node/nodeX/cpumap文件的内容
+  // CPU 节点的亲和性掩码是通过读取 Linux 系统的 NUMA 拓扑（cpumap 文件）获得的，代表该 NUMA 节点下所有物理上属于它的 CPU core。这与进程/线程的亲和性无关，是一种硬件结构信息。
   cpu_set_t cpuMask = cpu->cpu.affinity;
 
 #ifdef ENABLE_TRACE
@@ -1706,16 +1712,19 @@ ncclResult_t ncclTopoGetCpuAffinity(struct ncclTopoSystem* system, int rank, cpu
 #endif
 
   cpu_set_t finalMask;
+  //判断是否忽略当前进程的 affinity（由环境变量控制）
   if (ncclParamIgnoreCpuAffinity())
     // Ignore the CPU affinity set and use the GPU one instead
+  //如果忽略，则直接用靠近 GPU 的 CPU 掩码（cpuMask）
     finalMask = cpuMask;
   else
-    // Use a subset of the GPU affinity set
+    // Use a subset of the GPU affinity set 否则，取当前进程 affinity 和靠近 GPU 的 affinity 的交集（CPU_AND），确保不会越权。
     CPU_AND(&finalMask, &mask, &cpuMask);
 
   memcpy(affinity, &finalMask, sizeof(cpu_set_t));
 
-  // If there is a non empty set, use it to set affinity
+  // If there is a non empty set, use it to set affinity 
+  // 如果最终掩码非空，则打印设置信息。
   if (CPU_COUNT(&finalMask)) {
     char affinityStr[sizeof(cpu_set_t)*2];
     NCCLCHECK(ncclCpusetToStr(&finalMask, affinityStr));

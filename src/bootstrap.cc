@@ -1126,6 +1126,7 @@ static ncclResult_t socketRingAllGather(struct ncclSocket* sendSock, struct nccl
 - 从前一个进程接收数据（存入 recv_data ）
 - 向后一个进程发送上一轮收到的数据（从 send_data 发送） 这里画个图就知道了，只发送上一轮接收到的数据，可以节省带宽。
 - 通过计算 rslice 和 sslice 确定当前轮次要接收和发送的数据位置
+只有当前轮次发送和接收结束后，才进行下一轮通信。
   */
   for (int i = 0; i < nranks - 1; i++) {
     size_t rslice = (rank - i - 1 + nranks) % nranks;

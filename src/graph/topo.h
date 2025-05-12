@@ -69,7 +69,7 @@ extern const char* topoLinkTypeStr[];//连接类型字符串数组声明。
 #define PATH_PXB 4
 
 // Connection between a GPU and a NIC using an intermediate GPU. Used to enable rail-local, aggregated network send/recv operations.
-//GPU 和 NIC（网络接口卡）之间通过中间 GPU 连接的路径
+//GPU 和 NIC（网络接口卡）之间通过中间 GPU 连接的路径。这里可以看rail optimized拓扑。通过gpu到gpu，使得数据能够在不越轨（不跳跃到spine网络）的情况下将其发送到目标
 #define PATH_PXN 5
 
 // Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU) 经过PCIe主桥（通常是CPU）的路径类型编号
@@ -143,7 +143,7 @@ struct ncclTopoNode {
       int arch; // CPU架构
       int vendor;//CPU 厂商（如 Intel、AMD、兆芯等
       int model;//CPU 的具体型号（如 BDW、SKL、YONGFENG 等）
-      cpu_set_t affinity;
+      cpu_set_t affinity;//亲和性，但是这个是NUMA级别的，和进程的亲和性不同。
     }cpu;
     struct {
       uint64_t device; // PCI设备号（用于唯一标识PCI设备）。
@@ -155,7 +155,7 @@ struct ncclTopoNode {
   // 每条路径是由一系列 ncclTopoLink* 组成，描述了从本节点出发，经过哪些边（links），最终到达目标类型节点。
   // 这里ncclTopoLinkList*其实就是多条路径的集合
   struct ncclTopoLinkList* paths[NCCL_TOPO_NODE_TYPES]; 
-  // Used during search
+  // Used during search 搜索中用于标记是否已经使用
   uint64_t used;
 };
 
