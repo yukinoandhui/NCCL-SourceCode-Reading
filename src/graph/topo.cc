@@ -1386,6 +1386,7 @@ ncclResult_t ncclTopoGetSharedState(ncclTopoNetState** state, const char* name, 
   return ncclInternalError;
 }
 //根据 NCCL 通信器 comm ，构建当前节点的完整拓扑系统结构 system ，并支持 XML 拓扑导入、自动检测、融合、导出等功能。
+//这里获取的是本地的拓扑（融合后的）。需要跨网络通信的不算。
 ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** system, const char* dumpXmlFile) {
   ncclResult_t ret = ncclSuccess;
   struct ncclXml* xml;

@@ -17,7 +17,7 @@
     #define __device__
   #endif
 #endif
-
+//向上取整数
 #define DIVUP(x, y) \
     (((x)+(y)-1)/(y))
 

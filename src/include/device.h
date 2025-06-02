@@ -160,12 +160,12 @@ struct ncclRing {
 #define NCCL_MAX_TREE_ARITY 3
 struct ncclTree {
   int depth;
-  int up;
+  int up; //up就是本节点内的链中上一个节点的rank，同理down
   int down[NCCL_MAX_TREE_ARITY];
 };
 
 #define NCCL_MAX_DIRECT_ARITY 7
-struct ncclDirect {
+struct ncclDirect { //直接利用网络进行allreduce的 Collnet Direct
   int depth;
   int out;
   int nHeads;   // Number of parallel N<->1<->net operations we'll do in parallel; size of up/down
@@ -340,6 +340,7 @@ constexpr size_t ncclDevWorkSize(enum ncclDevWorkType type) {
 #define NCCL_MAX_DEV_WORK_BATCH_BYTES 1024
 #define NCCL_MAX_DEV_WORK_BATCH_COLLS (NCCL_MAX_DEV_WORK_BATCH_BYTES/sizeof(ncclDevWorkColl))
 #define NCCL_MAX_DEV_WORK_P2P_PER_BATCH 8
+//每个channel需要的工作批次结构体。
 struct alignas(16) ncclDevWorkBatch {
   union {
     struct {
@@ -449,7 +450,7 @@ template<typename T, typename ...Ts>
 __host__ __device__ constexpr T max_constexpr(T a, T b, Ts ...c) {
   return max_constexpr<T>((a > b ? a : b), c...);
 }
-
+//根据设备内核参数区（argsBytes）的大小，计算当前最多能支持多少个通信通道
 constexpr int ncclDevMaxChannelsForArgsBytes(size_t argsBytes) {
   return min_constexpr<size_t>(MAXCHANNELS, (argsBytes - sizeof(struct ncclDevKernelArgs))/sizeof(struct ncclDevWorkBatch));
 }

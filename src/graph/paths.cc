@@ -831,6 +831,8 @@ ncclResult_t ncclTopoTrimSystem(struct ncclTopoSystem* system, struct ncclComm* 
   }
   //如果剩下的 GPU 数量等于通信域的总 rank 数，说明所有 GPU 都属于本域，这时可以把所有 NET 节点（网络节点）也移除。
   //如果有 GPU 被移除，说明通信域内的 GPU 不是全部本地的，可能还需要通过网络与其他节点通信，所以不能移除网络节点。
+  //对于多机多卡，system->nodes[GPU].count 是不等于nRanks的，所以网络节点不会被移除
+  //
   if (system->nodes[GPU].count == comm->nRanks) {
     for (int n=system->nodes[NET].count-1; n>=0; n--)
       NCCLCHECKGOTO(ncclTopoRemoveNode(system, NET, n), ret, fail);
@@ -957,7 +959,7 @@ ncclResult_t ncclTopoGetGpuMinPath(struct ncclTopoSystem* system, int type, int*
   *min = minPath;
   return ncclSuccess;
 }
-
+//计算gpu到指定类型的结点的通信路径的最大路径类型
 ncclResult_t ncclTopoGetGpuMaxPath(struct ncclTopoSystem* system, int type, int* max) {
   int maxPath = PATH_LOC;
   for (int i=0; i<system->nodes[GPU].count; i++) {

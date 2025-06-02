@@ -170,9 +170,9 @@ struct ncclChannel {
   /* devPeer pointer array used for host side access */
   struct ncclDevChannelPeer** devPeersHostPtr;
   // 通信拓扑结构
-  struct ncclRing ring;
+  struct ncclRing ring;//记录了当前rank在当前channel中的前驱和后继是谁
   int* devRingUserRanks;
-  struct ncclTree tree;
+  struct ncclTree tree; //当前channel在树形拓扑中的位置信息，例如其父节点是谁
   //专为CollNet优化的链式或直接通信模式
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;
@@ -495,10 +495,10 @@ struct ncclComm {
   int localRank;
   int localRanks;
   int maxLocalRanks;
-  int* rankToNode;
+  int* rankToNode;//记录每个rank属于哪个节
   int* rankToLocalRank;
   int* localRankToRank;
-  // localRanks and localRanktoRank for all nodes
+  // localRanks and localRanktoRank for all nodes 是一个node数组，记录每个node上的loca rank的数量和每个local rank对应的全局rank
   struct ncclNodeRanks* nodeRanks;
   // MNNVL: Multi-Node NVLink
   int MNNVL; // true when MNNVL is available

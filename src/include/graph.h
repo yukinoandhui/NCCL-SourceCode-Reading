@@ -90,7 +90,7 @@ struct ncclTopoGraph {
   // Input / output
   int id; // ring : 0, tree : 1, collnet : 2, nvls : 3, collnetDirect : 4  。表示拓扑图的类型，0: 环形(Ring)算法，3: NVLS算法
   int pattern;// 通信模式，定义了数据如何在GPU和网络接口之间流动
-  int crossNic;//是否跨网卡通信
+  int crossNic;//是否跨网卡通信 跨网卡通信（crossNic） ，就是指在单节点内部，合理分配GPU到不同NIC的通信路径，使得多块网卡都能被充分利用。
   int collNet;//是否使用CollNet网络
   int minChannels;//最小通道数
   int maxChannels;
@@ -105,7 +105,7 @@ struct ncclTopoGraph {
   int nHops;//通信路径中的跳数
   //channelId* system->nodes[GPU].count就是每个通道的头部gpu的rank。它是一个一维数组，但可以理解为二维结构： intra[channelId * gpuCount + gpuIndex] 。
   int intra[MAXCHANNELS*NCCL_TOPO_MAX_NODES];//节点内通信路径数组,存储每个通道channel内部的通信路径，用于指导节点内GPU之间的数据传输。也就是存的gpu rank
-  int64_t inter[MAXCHANNELS*2];//是一个记录每个通道所选用的NET（NIC）id的数组。(一般是两个？)
+  int64_t inter[MAXCHANNELS*2];//是一个记录每个通道所选用的NET（NIC）id的数组。(一般是两个，我的理解是，跨网卡的话，ring模式下会出现这种情况：net1->gpu0->gpu1->net2)
 };
 ncclResult_t ncclTopoCompute(struct ncclTopoSystem* system, struct ncclTopoGraph* graph);
 
@@ -113,11 +113,11 @@ ncclResult_t ncclTopoPrintGraph(struct ncclTopoSystem* system, struct ncclTopoGr
 ncclResult_t ncclTopoDumpGraphs(struct ncclTopoSystem* system, int ngraphs, struct ncclTopoGraph** graphs);
 //存储不同通信算法下每个通道的进程关系
 struct ncclTopoRanks {
-  int ringRecv[MAXCHANNELS];// 每个通道中当前rank从哪个rank接收数据（环形通信）
-  int ringSend[MAXCHANNELS];// 每个通道中当前rank向哪个rank发送数据（环形通信）
+  int ringRecv[MAXCHANNELS];// ringRecv[c]：当前rank所在的”部分 channel c ”的头节点，也可以理解为所在机器的头节点rank
+  int ringSend[MAXCHANNELS];// 当前rank所在的”部分 channel c ”的尾节点也可以理解为所在机器的尾节点rank；
   int ringPrev[MAXCHANNELS];// 每个通道中当前rank在环中的前一个rank
   int ringNext[MAXCHANNELS];// 每个通道中当前rank在环中的下一个rank
-  int treeToParent[MAXCHANNELS];// 每个通道中当前rank在树形通信中的父节点rank
+  int treeToParent[MAXCHANNELS];// 每个通道中当前rank在树形通信中的父节点rank。 不过我的理解是这个node的中的头rank
   int treeToChild0[MAXCHANNELS];// 每个通道中当前rank在树形通信中的第一个子节点rank
   int treeToChild1[MAXCHANNELS]; // 每个通道中当前rank在树形通信中的第二个子节点rank
   int nvlsHeads[MAXCHANNELS];// NVLS算法中，每个通道的head节点rank

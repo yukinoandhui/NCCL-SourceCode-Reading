@@ -570,10 +570,17 @@ ncclResult_t ncclTopoSearchRecGpu(struct ncclTopoSystem* system, struct ncclTopo
     //所以这里要把graph->nChannels--;也只是回退临时变量。
     return ncclSuccess;
   }
-  graph->intra[graph->nChannels*ngpus+step] = gpu->gpu.rank;//记录一下当前gpu的rank
+
+  //记录一下当前gpu的rank
+  graph->intra[graph->nChannels*ngpus+step] = gpu->gpu.rank;
+
+
   int g = gpu - system->nodes[GPU].nodes;// 计算当前GPU在nodes数组中的下标
   int* nets = NULL;
-  if (step == backToNet) {// 如果需要回到网络节点（如跨节点通信）backToNet的值: ring：system->nodes[GPU].count-1，split tree：1. 其他都是0
+  // 如果需要回到网络节点（如跨节点通信）backToNet的值: ring：system->nodes[GPU].count-1，split tree：1. 其他都是0
+  // 我的理解是：需要有个gpu节点是负责对外通信的。backToNet就是这个gpu。所以对于tree，其实就是0，并且会回到起始网卡（也就是同一张网卡），而对于Balanced Tree，就是0和1gpu，并且回到任意的一张网卡（满足条件即可）
+  if (step == backToNet) {
+    //
     // first get back to NIC
     if (system->nodes[NET].count) {
       int startNetIndex;
@@ -581,11 +588,12 @@ ncclResult_t ncclTopoSearchRecGpu(struct ncclTopoSystem* system, struct ncclTopo
       struct ncclTopoNode* startNet = system->nodes[NET].nodes+startNetIndex;
       int netCount;
       NCCLCHECK(ncclCalloc(&nets, system->nodes[NET].count));
+      
       NCCLCHECKGOTO(ncclTopoSelectNets(system, graph->typeInter, g, nets, &netCount), ret, fail);
       for (int i=0; i<netCount; i++) {
         int n = nets[i];
         struct ncclTopoNode* net = system->nodes[NET].nodes+n;
-        if (graph->pattern == NCCL_TOPO_PATTERN_TREE && net->id != startNet->id) continue; // Trees are symmetric
+        if (graph->pattern == NCCL_TOPO_PATTERN_TREE && net->id != startNet->id) continue; // Trees are symmetric 只允许回到起始的网络节点（保证树的对称性）。
         if (graph->pattern == NCCL_TOPO_PATTERN_RING && graph->crossNic == 2) {
           if (graph->nChannels & 1 && net->id != graph->inter[(graph->nChannels-1)*2]) continue;
         } else {
@@ -593,6 +601,7 @@ ncclResult_t ncclTopoSearchRecGpu(struct ncclTopoSystem* system, struct ncclTopo
         }
 
         // Balanced Tree : count half of the bandwidth on first two GPUs
+        // 在Balanced Tree 模式下，前两个 GPU 只计入一半带宽。并且此时是允许回到不同的net的
         int nextBackToNet = -1;
         float bwInterSave = graph->bwInter;
         if (graph->pattern == NCCL_TOPO_PATTERN_BALANCED_TREE) {
@@ -679,7 +688,7 @@ ncclResult_t ncclTopoSearchRecNet(struct ncclTopoSystem* system, struct ncclTopo
     if (net->net.bw < bw) continue; // 如果NET带宽不足，跳过这个net
     /*
       Ring模式下crossNic=2且当前通道为奇数通道时，要求NET节点id和上一通道一致，否则跳过
-      graph->crossNic == 2 说明允许跨NIC（网卡）通信，并且是“全跨NIC”模式（2通常代表允许所有跨NIC的情况）。
+      graph->crossNic == 2 说明允许跨NIC（网卡）通信，并且是“全跨NIC”模式（2代表默认不跨网卡，但是如果跨网卡更优，则允许所有跨NIC的情况）。
       graph->inter[(graph->nChannels-1)*2+1] 取的是上一个通道（nChannels-1）所选用的第二个NET的id。
       这里的 graph->inter 是一个记录每个通道所选用的NET（NIC）id的数组。
       这句的意思是： 如果当前是奇数通道，并且当前尝试的NET不是上一个通道的第二个NET，则跳过本次循环 。
@@ -690,6 +699,8 @@ ncclResult_t ncclTopoSearchRecNet(struct ncclTopoSystem* system, struct ncclTopo
        
 
     graph->inter[graph->nChannels*2] = net->id; // 记录当前通道使用的NET节点id
+
+
     graph->latencyInter = net->net.latency;// 记录当前NET的延迟
       // 占用NET节点带宽（所有同ASIC同端口的NET都减去本通道带宽）
       /*
@@ -803,7 +814,7 @@ fail:
  //例子：假设是两机16卡（每个机器8卡），此时backToNet=7（意思是7这个卡开始准备返回网络），backToFirstRank=-1；如果是单机8卡，此时backToNet = -1，backToFirstRank=7
 ncclResult_t ncclTopoSearchParams(struct ncclTopoSystem* system, int pattern, int* backToNet, int* backToFirstRank) {
   if (system->nodes[NET].count) {//如果系统有网络节点（即多机通信），则根据通信模式（Ring/Split Tree/Tree）设置 backToNet ， backToFirstRank 设为 -1（不用）。
-    if (pattern == NCCL_TOPO_PATTERN_RING) *backToNet = system->nodes[GPU].count-1;//Ring：在递归搜索时，最后一个 GPU（索引为 N-1）完成后， 需要回到最初的 NET n ，而不是回到“最后一个 GPU 所在的网络节点”。
+    if (pattern == NCCL_TOPO_PATTERN_RING) *backToNet = system->nodes[GPU].count-1;//Ring：在递归搜索时，最后一个 GPU（索引为 N-1）完成后， 需要回到最初的 NET ，而不是回到“最后一个 GPU 所在的网络节点”。
     else if (pattern == NCCL_TOPO_PATTERN_SPLIT_TREE) *backToNet = 1;//Split Tree：回到第1个GPU
     else *backToNet = 0; //其它模式：回到第0个
     *backToFirstRank = -1;//只要系统中存在 NET 节点（即多机通信场景），无论是哪种 pattern， *backToFirstRank 都会被设置为 -1。因为此时应该是回到网络
@@ -815,11 +826,12 @@ ncclResult_t ncclTopoSearchParams(struct ncclTopoSystem* system, int pattern, in
   return ncclSuccess;
 }
 //这个函数就是搜索处来一个路径 对于单机，首先尝试0-1-2-3...的顺序（PCI）然后重复这个channel。如果允许不同的channel，就尝试所有点作为起始点的情况。
+// 多看这个问题https://github.com/NVIDIA/nccl/issues/545
 ncclResult_t ncclTopoSearchRec(struct ncclTopoSystem* system, struct ncclTopoGraph* graph, struct ncclTopoGraph* saveGraph, int* time) {
   int backToNet, backToFirstRank;//根据当前通信模式（如 Ring、Tree 等）设置回退参数，为后续递归搜索做准备。
   NCCLCHECK(ncclTopoSearchParams(system, graph->pattern, &backToNet, &backToFirstRank));
   if (system->nodes[NET].count) {
-    // Start from NET 从net开始出发进行搜索
+    // Start from NET 从net开始出发进行搜索，其实和搜索gpu类似，ring：net1->gpu0->gpu1->net2/net1
     ncclTopoSearchRecNet(system, graph, saveGraph, backToNet, backToFirstRank, time);
   } else {
     // Intra-node only.
@@ -991,17 +1003,17 @@ ncclResult_t ncclTopoGetXmlFromGraphs(int ngraphs, struct ncclTopoGraph** graphs
   }
   return ncclSuccess;
 }
-
+//在满足一定条件下，将当前通信通道数加倍（duplication），以提升带宽利用率和通信并发度 。
 ncclResult_t ncclTopoDupChannels(struct ncclTopoGraph* graph, int ccMin, int ngpus) {
   if (graph->nChannels == 0) return ncclSuccess;
   if (graph->pattern == NCCL_TOPO_PATTERN_NVLS) return ncclSuccess;
   if (graph->bwIntra < 25.0) return ncclSuccess;
   if (ccMin > 80 && graph->bwIntra < 50.0 && graph->nChannels > 4) return ncclSuccess;
-
+  //复制通道信息 将原有的 intra（节点内）通道信息复制到新通道的后半部分，实现通道加倍。同理，复制 inter（节点间）通道信息。
   int dupChannels = std::min(graph->nChannels*2, graph->maxChannels);
   memcpy(graph->intra+graph->nChannels*ngpus, graph->intra, (dupChannels-graph->nChannels)*ngpus*sizeof(int));
   memcpy(graph->inter+graph->nChannels*2,graph->inter, (dupChannels-graph->nChannels)*2*sizeof(int64_t));
-  graph->bwIntra /= DIVUP(dupChannels, graph->nChannels);
+  graph->bwIntra /= DIVUP(dupChannels, graph->nChannels);//节点内带宽按通道数均摊。
   graph->bwInter /= DIVUP(dupChannels, graph->nChannels);
   graph->nChannels = dupChannels;
   return ncclSuccess;
@@ -1033,6 +1045,7 @@ float sm100SpeedArrayInter[] = { 48.0, 45.0, 42.0, 40.0, 30.0, 24.0, 22.0, 20.0,
 ncclResult_t ncclTopoCompute(ncclTopoSystem* system, struct ncclTopoGraph* graph) {
   int ngpus = system->nodes[GPU].count;
   //判断是否需要跨网卡（crossNic）跨网卡通信（crossNic） ，就是指在单节点内部，合理分配GPU到不同NIC的通信路径，使得多块网卡都能被充分利用。
+  //这个主要是跟rail optmized拓扑有关。
   //注意，如果是单机，前面的trim已经把网卡node删掉了。
   //这里inter主要是指gpu到网卡，intra是gpu到gpu
   int crossNic = (system->nodes[NET].count > 1) &&
@@ -1057,7 +1070,7 @@ ncclResult_t ncclTopoCompute(ncclTopoSystem* system, struct ncclTopoGraph* graph
     //获取GPU到NET的最小和最大路径类型
     NCCLCHECK(ncclTopoGetGpuMinPath(system, NET, &minTypeInter));
     NCCLCHECK(ncclTopoGetGpuMaxPath(system, NET, &maxTypeInter));
-    maxTypeIntra = maxTypeInter;/* 这里AI的解释如下（但是我觉得有点问题，可能要等全部代码看完后才能懂）：
+    maxTypeIntra = maxTypeInter;/* 这里AI的解释如下（但是我觉得有点问题，可能要等全部代码看完后才能懂，目前看了一些经典拓扑结构后好像懂了）：
     但如果系统中有网络节点（NET） ，说明通信模式可能涉及跨节点（多机多卡），这时 NCCL 需要保证节点内和节点间的路径类型选择是一致的，避免出现“节点内允许的路径类型比节点间更宽松”导致的通信不一致或性能问题。
     - 如果 maxTypeInter 是 PATH_SYS，说明跨节点通信最多允许到系统级别的路径（如跨 NUMA、跨主板）。
     - 这时把 maxTypeIntra 也设为 PATH_SYS，意味着节点内通信也不能走比 PATH_SYS 更“远”的路径（比如不能走 PATH_NET，因为那是跨主机的网络路径）。*/
@@ -1141,8 +1154,8 @@ search:
   //根据当前是否要求“相同通道”或是树型模式，选择不同的超时时间。
   int time = tmpGraph.sameChannels ? NCCL_SEARCH_TIMEOUT_SAMECHANNELS :
     tmpGraph.pattern == NCCL_TOPO_PATTERN_TREE ? NCCL_SEARCH_TIMEOUT_TREE : NCCL_SEARCH_TIMEOUT;
-  tmpGraph.nChannels = 0;//初始化通道数
-  globalTimeout -= time;//全局超时递减，防止整体搜索时间过长
+  tmpGraph.nChannels = 0;// 初始化通道数
+  globalTimeout -= time;// 全局超时递减，防止整体搜索时间过长
   //调用 ncclTopoSearchRec 递归搜索拓扑方案
   NCCLCHECK(ncclTopoSearchRec(system, &tmpGraph, graph, &time));
 #if 0
@@ -1232,7 +1245,7 @@ done:
     pass = 2;//进入第二阶段
   }
 
-  if (pass == 2) {//目标是在保持通道数不变的情况下，尝试提高带宽
+  if (pass == 2) {//在不减少通道数的前提下，尝试提高带宽
     // See if we can increase bw
     if (time != 0 && speedIndex > 0) {
       if (graph->pattern == NCCL_TOPO_PATTERN_RING) {//对于环形模式，同时提高节点内和节点间带宽

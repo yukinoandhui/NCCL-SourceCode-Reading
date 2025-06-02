@@ -656,7 +656,7 @@ static ncclResult_t computeBuffSizes(struct ncclComm* comm) {
 NCCL_PARAM(GraphDumpFileRank, "GRAPH_DUMP_FILE_RANK", 0);
 NCCL_PARAM(CollNetNodeThreshold, "COLLNET_NODE_THRESHOLD", 2);
 NCCL_PARAM(NvbPreconnect, "NVB_PRECONNECT", 1);
-NCCL_PARAM(AllocP2pNetLLBuffers, "ALLOC_P2P_NET_LL_BUFFERS", 0);
+NCCL_PARAM(AllocP2pNetLLBuffers, "ALLOC_P2P_NET_LL_BUFFERS", 0);//NCCL_ALLOC_P2P_NET_LL_BUFFERS 指示通信器为所有点对点（P2P）网络连接分配专用的低延迟（LL）缓冲区。这使得所有进程（ranks）能够针对小于 NCCL_P2P_LL_THRESHOLD 阈值大小的延迟敏感型发送和接收操作使用低延迟协议。节点内（intranode）的 P2P 传输始终会分配专用的低延迟缓冲区。如果在高进程数的 all-to-all 工作负载中启用此选项，可能会导致较高的内存开销（随进程数线性增长）。
 
 // MNNVL: Flag to indicate whether to enable Multi-Node NVLink
 NCCL_PARAM(MNNVLEnable, "MNNVL_ENABLE", 2);
@@ -831,6 +831,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   // Compute paths between GPUs and NICs 计算 GPU 与 NIC 之间的路径。
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
   // Remove inaccessible GPUs and unused NICs 移除不可达的 GPU 和未使用的 NIC。（主要是删除非本地通信域的gpu、网卡）
+  // 前面ncclTopoGetSystem已经获取了整个本地的拓扑。如果发现整个集群就是本地的，不需要网络通信，那就把网络节点去掉
   NCCLCHECKGOTO(ncclTopoTrimSystem(comm->topo, comm), ret, fail);
   // Recompute paths after trimming 再次计算路径，确保拓扑信息准确。
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
@@ -915,9 +916,10 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
   timers[TIMER_INIT_GRAPHS] = clockNano() - timers[TIMER_INIT_GRAPHS];
 
-  // Initialize num P2P LL buffers for this communicator
+  // Initialize num P2P LL buffers for this communicator 是否为该 communicator 分配 P2P LL（Low Latency）缓冲区。
+  //
   comm->allocP2pNetLLBuffers = ncclParamAllocP2pNetLLBuffers() == 1;
-
+//如果当前 rank 等于指定的 dump rank，则将当前的五种通信拓扑（Ring、Tree、CollNetDirect、CollNetChain、NVLS）信息导出（通常用于调试和分析）。
   if (comm->rank == ncclParamGraphDumpFileRank()) {
     struct ncclTopoGraph* dumpGraphs[5] = { ringGraph, treeGraph, collNetDirectGraph, collNetChainGraph, nvlsGraph };
     NCCLCHECKGOTO(ncclTopoDumpGraphs(comm->topo, 5, dumpGraphs), ret, fail);
@@ -925,7 +927,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   // Because timers[[TIMER_INIT_ALLGATHER] already contains the timing of the first allgather,
   // we temporarily store the start time of the subsequent one in an as-of-yet unused CONNECT timer.
-  timers[TIMER_INIT_CONNECT] = clockNano();
+  timers[TIMER_INIT_CONNECT] = clockNano();//记录 AllGather3 操作的起始时间，用于性能分析。
   // AllGather3 - begin
   NCCLCHECKGOTO(ncclCalloc(&allGather3Data, nranks), ret, fail);
 
@@ -942,31 +944,33 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   allGather3Data[rank].cpuArch = comm->cpuArch;
   allGather3Data[rank].cpuVendor = comm->cpuVendor;
-
+  //设置通道数
   comm->nChannels = std::min(treeGraph->nChannels, ringGraph->nChannels);
+  //ncclTopoPreset 预设拓扑相关信息。
   NCCLCHECKGOTO(ncclTopoPreset(comm, graphs, &allGather3Data[rank].topoRanks), ret, fail);
 
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allGather3Data, sizeof(*allGather3Data)), ret, fail);
 
   // Determine nNodes, firstRanks, ...
-  NCCLCHECKGOTO(ncclCalloc(&nodesFirstRank, nranks), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&nodesFirstRank, nranks), ret, fail);//记录每个节点的第一个rank
   NCCLCHECKGOTO(ncclCalloc(&nodesTreePatterns, nranks), ret, fail);
-  NCCLCHECKGOTO(ncclCalloc(&comm->rankToNode, comm->nRanks), ret, fail);
-  for (int r=0; r<nranks; r++) {
+  NCCLCHECKGOTO(ncclCalloc(&comm->rankToNode, comm->nRanks), ret, fail);//
+  for (int r=0; r<nranks; r++) { //遍历所有rank，确定节点归属,同时也计算了node数量。
     int node;
-    int firstRank = allGather3Data[r].topoRanks.ringRecv[0];
+    int firstRank = allGather3Data[r].topoRanks.ringRecv[0];//当前rank所在节点的第一个rank
     for (node=0; node<comm->nNodes && nodesFirstRank[node] != firstRank; node++);
-    if (node == comm->nNodes) {
+    if (node == comm->nNodes) {//说明这是个新节点，nodesFirstRank还没记录。
       comm->nNodes++;
       nodesFirstRank[node] = firstRank;
       // Record tree pattern of each node as they can be different depending on sm arch
       nodesTreePatterns[node] = allGather3Data[r].graphInfo[NCCL_ALGO_TREE].pattern;
     }
-    comm->rankToNode[r] = node;
+    comm->rankToNode[r] = node;//建立rank到node的映射
 
     if (comm->cpuArch != allGather3Data[r].cpuArch &&
-        comm->cpuArch != NCCL_TOPO_CPU_ARCH_MIXED) {
-      comm->cpuArch = NCCL_TOPO_CPU_ARCH_MIXED;
+        comm->cpuArch != NCCL_TOPO_CPU_ARCH_MIXED) {//检测CPU架构和厂商是否混合
+      comm->cpuArch = NCCL_TOPO_CPU_ARCH_MIXED;//- 如果发现不同的CPU架构或厂商，则将comm->cpuArch/cpuVendor标记为MIXED。
+      
     }
     if (comm->cpuVendor != allGather3Data[r].cpuVendor &&
         comm->cpuVendor != NCCL_TOPO_CPU_VENDOR_MIXED) {
@@ -976,6 +980,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   // Alert the user to the presence of mixed CPUs. In the past this has caused
   // locks in some collective routines. This may help debug issues in the future.
+  //过去这种混合CPU的环境曾导致某些"collective routines"（集体例程，通常指MPI等并行计算中的集合通信操作）出现"locks"（锁死/死锁）问题。
   if (rank==0) {
     if (comm->cpuArch == NCCL_TOPO_CPU_ARCH_MIXED) {
       INFO(NCCL_GRAPH, "CPUs with mixed architecture were detected.");
@@ -985,21 +990,25 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     }
   }
 
+  /*
+  下面这几块代码就是计算rank的映射关系
+  */
+
   // Now that we know nNodes, alloc nodeRanks and compute localRanks for each node
   NCCLCHECKGOTO(ncclCalloc(&comm->nodeRanks, comm->nNodes), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&comm->rankToLocalRank, comm->nRanks), ret, fail);
-  for (int r=0; r<comm->nRanks; r++) {
+  for (int r=0; r<comm->nRanks; r++) {//这里就是计算一下具体的每个rank的localRank编号。相当于初始化了。
     int node = comm->rankToNode[r];
     comm->rankToLocalRank[r] = comm->nodeRanks[node].localRanks;
     comm->nodeRanks[node].localRanks++;
   }
-  // Allocate ranks arrays for each node
+  // Allocate ranks arrays for each node 为每个节点分配本地rank到全局rank的映射数组 
   for (int n=0; n<comm->nNodes; n++) {
     NCCLCHECKGOTO(ncclCalloc(&comm->nodeRanks[n].localRankToRank, comm->nodeRanks[n].localRanks), ret, fail);
     comm->maxLocalRanks = std::max(comm->maxLocalRanks, comm->nodeRanks[n].localRanks);
-    comm->nodeRanks[n].localRanks = 0;
+    comm->nodeRanks[n].localRanks = 0;//这里置为0是为了下面计算localRankToRank。
   }
-  // And fill the ranks arrays
+  // And fill the ranks arrays 计算localRankToRank，逻辑和rankToLocalRank一样，这里需要注意的是前面comm->nodeRanks[n].localRanks = 0这句话不能少。
   for (int r=0; r<comm->nRanks; r++) {
     int node = comm->rankToNode[r];
     comm->nodeRanks[node].localRankToRank[comm->nodeRanks[node].localRanks++] = r;
@@ -1022,11 +1031,12 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   INFO(NCCL_INIT, "comm %p rank %d nRanks %d nNodes %d localRanks %d localRank %d MNNVL %d",
        comm, rank, comm->nRanks, comm->nNodes, comm->localRanks, comm->localRank, comm->MNNVL);
 
-  nChannelsOrig = comm->nChannels;
+  nChannelsOrig = comm->nChannels;//记录原始通道数，后续用于判断是否需要移动通道。
   NCCLCHECKGOTO(ncclCalloc(&allTopoRanks, comm->nRanks), ret, fail);
   for (int i=0; i<nranks; i++) {
     allTopoRanks[i] = &allGather3Data[i].topoRanks;
     // Make sure we align all ranks so that the tuning is consistent across ranks
+    // 内层循环遍历所有算法（如 ring、tree、collnet 等），对每种算法的 graph 参数（如 nChannels、带宽、类型等）取所有 rank 的最小值或最大值，确保所有 rank 的配置一致。
     for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
       graphs[a]->nChannels = std::min(allGather3Data[i].graphInfo[a].nChannels, graphs[a]->nChannels);
       graphs[a]->sameChannels = std::min(allGather3Data[i].graphInfo[a].sameChannels, graphs[a]->sameChannels);
@@ -1037,10 +1047,12 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       graphs[a]->crossNic = std::max(allGather3Data[i].graphInfo[a].crossNic, graphs[a]->crossNic);
     }
   }
-  if (graphs[NCCL_ALGO_COLLNET_CHAIN]->nChannels == 0) comm->collNetSupport = 0;
+  if (graphs[NCCL_ALGO_COLLNET_CHAIN]->nChannels == 0) comm->collNetSupport = 0;//如果 CollNet 或 NVLS 算法的通道数为 0，则禁用对应的通信支持
   if (graphs[NCCL_ALGO_NVLS]->nChannels == 0) comm->nvlsSupport = comm->nvlsChannels = 0;
-
+  //统一 ring 和 tree 算法的通道数，取二者最小值。
   comm->nChannels = treeGraph->nChannels = ringGraph->nChannels = std::min(treeGraph->nChannels, ringGraph->nChannels);
+//如果 comm->nChannels < nChannelsOrig ，说明有部分通道被裁剪掉了 但在 Preset 阶段，原本的通道后面可能已经被复制了一份（比如原来有 4 个通道，复制后变成 8 个，后 4 个是复制品）。
+//例如：原来有 4 个通道，复制后变成 8 个，最后只保留 3 个通道。此时需要把原本第 5、6、7、8 个通道（复制品）移动到第 4、5、6 个位置。 
   if (comm->nChannels < nChannelsOrig) {
     // We started duplicating channels during Preset(), so we need to move the
     // duplicated channels since we have removed some.
@@ -1048,6 +1060,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
 
   // Determine CollNet support after all-gather now that we know nNodes and each node localRanks
+  //CollNet 支持判断：如果节点数小于阈值，则禁用 CollNet
   if (comm->collNetSupport == 1) {
     int collNetNodeThreshold = ncclParamCollNetNodeThreshold();
     if (comm->nNodes < collNetNodeThreshold) {
@@ -1055,10 +1068,12 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       comm->collNetSupport = 0;
     }
   }
+  // 检查当前拓扑是否全为 NVLink 互联，并设置 comm->isAllNvlink
   NCCLCHECK(ncclTopoPathAllNVLink(comm->topo, &comm->isAllNvlink));
-  comm->isOneRPN = (comm->maxLocalRanks == 1);
+  comm->isOneRPN = (comm->maxLocalRanks == 1);//判断是否为单 RPN（每节点只有一个本地 rank）
 
   NCCLCHECKGOTO(ncclCalloc(&rings, nranks*MAXCHANNELS), ret, fail);
+  //根据前面收集的所有信息，最终设置通信拓扑结构。
   NCCLCHECKGOTO(ncclTopoPostset(comm, nodesFirstRank, nodesTreePatterns, allTopoRanks, rings, graphs, parent), ret, fail);
   // AllGather3 - end
   timers[TIMER_INIT_ALLGATHER] += clockNano() - timers[TIMER_INIT_CONNECT];
