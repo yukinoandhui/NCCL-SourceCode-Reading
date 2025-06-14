@@ -47,7 +47,7 @@ NCCL_PARAM(GroupCudaStream, "GROUP_CUDA_STREAM", NCCL_GROUP_CUDA_STREAM);
 
 NCCL_PARAM(CheckPointers, "CHECK_POINTERS", 0);
 NCCL_PARAM(CommBlocking, "COMM_BLOCKING", NCCL_CONFIG_UNDEF_INT);
-NCCL_PARAM(RuntimeConnect, "RUNTIME_CONNECT", 1);
+NCCL_PARAM(RuntimeConnect, "RUNTIME_CONNECT", 1);//Dynamically connect peers during runtime 
 
 static ncclResult_t commReclaim(ncclComm_t comm);
 
@@ -339,7 +339,7 @@ ncclResult_t ncclCommEnsureReady(ncclComm_t comm) {
 exit:
   return ret;
 }
-
+//分配内存
 static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, int ndev, int rank) {
   if (ndev < 1) {
     WARN("invalid device count (%d) requested", ndev);
@@ -597,7 +597,7 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
 
   return ncclSuccess;
 }
-
+//主要用于初始化 NCCL 通信通道中的 ring（环）结构，使每个 rank 都能以自己为起点，方便后续的环形通信。
 static ncclResult_t setupChannel(struct ncclComm* comm, int channelId, int rank, int nranks, int* ringRanks) {
   TRACE(NCCL_INIT, "rank %d nranks %d", rank, nranks);
   NCCLCHECK(initChannel(comm, channelId));
@@ -605,13 +605,14 @@ static ncclResult_t setupChannel(struct ncclComm* comm, int channelId, int rank,
   struct ncclRing* ring = &comm->channels[channelId].ring;
   // Find our ring-distance from rank zero and reorganize ranks to start with rank.
   int ixZero=0, ixRank=0;
+  //找到 rank 0 和当前 rank 在 ring 中的位置（索引）
   for (int i=0; i < nranks; i++) {
     if (ringRanks[i] == 0) ixZero = i;
     if (ringRanks[i] == rank) ixRank = i;
   }
-  ring->index = (ixRank-ixZero + nranks)%nranks;
+  ring->index = (ixRank-ixZero + nranks)%nranks;//计算当前 rank 相对于 rank 0 的距离（ ring->index ），用于标记本 rank 在环中的起始位置。
   for (int i=0; i<nranks; i++) {
-    ring->userRanks[i] = ringRanks[(i+ixRank)%nranks];
+    ring->userRanks[i] = ringRanks[(i+ixRank)%nranks];//重新排列 ringRanks ，使得 ring->userRanks 以当前 rank 为起点，形成一个以本 rank 为首的环。
   }
   return ncclSuccess;
 }
@@ -623,30 +624,33 @@ NCCL_PARAM(BuffSize, "BUFFSIZE", -2);
 NCCL_PARAM(LlBuffSize, "LL_BUFFSIZE", -2);
 NCCL_PARAM(Ll128BuffSize, "LL128_BUFFSIZE", -2);
 
-NCCL_PARAM(P2pNetChunkSize, "P2P_NET_CHUNKSIZE", (1 << 17)); /* 128 kB */
+//The NCCL_P2P_NET_CHUNKSIZE controls the size of messages sent through the network for ncclSend/ncclRecv operations.
+NCCL_PARAM(P2pNetChunkSize, "P2P_NET_CHUNKSIZE", (1 << 17)); /* 128 kB */ 
 NCCL_PARAM(P2pPciChunkSize, "P2P_PCI_CHUNKSIZE", (1 << 17)); /* 128 kB */
 NCCL_PARAM(P2pNvlChunkSize, "P2P_NVL_CHUNKSIZE", (1 << 19)); /* 512 kB */
-
+//主要用于根据环境变量和默认值设置 NCCL 通信所需的缓冲区大小，并根据系统拓扑和通信方式调整点对点（P2P）通信的 chunk 大小。
 static ncclResult_t computeBuffSizes(struct ncclComm* comm) {
+  // 获取三种协议（LL、LL128、SIMPLE）的缓冲区大小环境变量
   int64_t envs[NCCL_NUM_PROTOCOLS] = { ncclParamLlBuffSize(), ncclParamLl128BuffSize(), ncclParamBuffSize() };
   int defaults[NCCL_NUM_PROTOCOLS] = { DEFAULT_LL_BUFFSIZE, DEFAULT_LL128_BUFFSIZE, DEFAULT_BUFFSIZE };
 
-  for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
-    comm->buffSizes[p] = envs[p] != -2 ? envs[p] : defaults[p];
+  for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {// 遍历所有协议
+    comm->buffSizes[p] = envs[p] != -2 ? envs[p] : defaults[p];// 如果环境变量有设置（不等于-2），用环境变量，否则用默认值
   }
 
-  if (comm->nNodes > 1) comm->p2pChunkSize = ncclParamP2pNetChunkSize();
-  else if (comm->isAllNvlink) comm->p2pChunkSize = ncclParamP2pNvlChunkSize();
-  else comm->p2pChunkSize = ncclParamP2pPciChunkSize();
+  if (comm->nNodes > 1) comm->p2pChunkSize = ncclParamP2pNetChunkSize();// 多节点时，ncclSend/ncclRecv操作通过网络发送的块大小
+  else if (comm->isAllNvlink) comm->p2pChunkSize = ncclParamP2pNvlChunkSize();// 单节点且全为 NVLink 时，取 NVLink 参数
+  else comm->p2pChunkSize = ncclParamP2pPciChunkSize();// 否则取 PCIe 参数
 
-  // Make sure P2P chunksize is not larger than coll chunksize.
+  // Make sure P2P chunksize is not larger than coll chunksize.  确保 P2P chunk 大小不会超过 collective 协议的缓冲区大小
   if (comm->p2pChunkSize * NCCL_STEPS > comm->buffSizes[NCCL_PROTO_SIMPLE]) comm->p2pChunkSize = comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
 
   if (comm->sharedRes->owner != comm) {
     /* make sure split comm p2pChunkSize won't exceed shared p2pChunkSize. */
+     /* 如果当前 comm 不是 sharedRes 的 owner，确保 p2pChunkSize 不超过共享的 tpP2pChunkSize */
     comm->p2pChunkSize = std::min(comm->p2pChunkSize, comm->sharedRes->tpP2pChunkSize);
   } else {
-    comm->sharedRes->tpP2pChunkSize = comm->p2pChunkSize;
+    comm->sharedRes->tpP2pChunkSize = comm->p2pChunkSize;// 如果是 owner，则设置共享的 tpP2pChunkSize
   }
 
   INFO(NCCL_INIT, "P2P Chunksize set to %d", comm->p2pChunkSize);
@@ -709,7 +713,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   struct allGatherInfo *allGather3Data = NULL;// 用于AllGather3阶段，收集所有rank的拓扑和rank关系信息
   struct ncclTopoRanks** allTopoRanks = NULL;// 指向所有rank的topoRanks指针数组
   int *nodesFirstRank = NULL, *nodesTreePatterns = NULL;// 记录每个节点的第一个rank和树模式
-  int *rings = NULL; // 存储环结构信息
+  int *rings = NULL; // 存储环结构信息。 对于给定channel，是以当前rank为起点构建的环。
   int* nvbPeers = NULL; // NVB相关的peer信息.NVB 连接是针对非 NVSwitch 系统的优化，其中使用GPU的内存来进行GPU之间的P2P通信，这些GPU不是通过NVLink直接连接的。
   struct ncclProxyConnector proxyConn; // 代理连接器
   int* pxnPeers = NULL;   // PXN相关的peer信息
@@ -1083,17 +1087,19 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   char line[1024];
   line[0]='\0';
   for (int c=0; c<comm->nChannels; c++) {
+    // 获取当前channel的tree结构体指针
     struct ncclTree* tree = &comm->channels[c].tree;
+    // 将当前channel的树结构信息追加到line字符串末尾
     snprintf(line+strlen(line), 1023-strlen(line), " [%d] %d/%d/%d->%d->%d",
         c, tree->down[0], tree->down[1], tree->down[2], rank, tree->up);
     INFO(NCCL_GRAPH, "Ring %02d : %d -> %d -> %d", c, comm->channels[c].ring.prev, comm->rank, comm->channels[c].ring.next);
   }
   line[1023] = '\0';
   INFO(NCCL_INIT, "Trees%s", line);
-
+  // 计算通信所需的缓冲区大小 每个rank都要为通信分配一些内存
   NCCLCHECKGOTO(computeBuffSizes(comm), ret, fail);
 
-  // Compute nChannels per peer for p2p
+  // Compute nChannels per peer for p2p 计算点对点通信时每个peer的通道数，
   NCCLCHECKGOTO(ncclTopoComputeP2pChannels(comm), ret, fail);
 
   /* until now, all info of comm should be known. We can initialize shared resources and
@@ -1104,34 +1110,57 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     comm->sharedRes->magic = comm->magic;
     comm->sharedRes->tpNChannels = comm->nChannels;
     comm->sharedRes->tpP2pNChannels = comm->p2pnChannels;
+    //拷贝 rank 到 localRank 的映射表到共享资源
     memcpy(comm->sharedRes->tpRankToLocalRank, comm->rankToLocalRank, sizeof(int) * comm->nRanks);
   }
   NCCLCHECKGOTO(ncclCalloc(&topParentLocalRanks, comm->localRanks), ret, fail);
   for (int i = 0; i < comm->localRanks; ++i) {
-    int tpRank = comm->topParentRanks[comm->localRankToRank[i]];
-    topParentLocalRanks[i] = comm->sharedRes->tpRankToLocalRank[tpRank];
+    int tpRank = comm->topParentRanks[comm->localRankToRank[i]];//获取当前 localRank 对应的 top parent rank
+    topParentLocalRanks[i] = comm->sharedRes->tpRankToLocalRank[tpRank];//将 top parent rank 映射为其对应的本地 rank，存入 topParentLocalRanks。
   }
   comm->topParentLocalRanks = topParentLocalRanks;
-
+  //检查并设置节点内 P2P 通信类型，更新 intraNodeP2pSupport 和 directMode。也就是是否支持节点内p2p，以及如果是同一个主机的同一个进程，则支持diret模式
   NCCLCHECKGOTO(ncclTransportCheckP2pType(comm, &comm->intraNodeP2pSupport, &comm->directMode), ret, fail);
   // Launch proxy service thread, after this, the proxy calls can be used.
-  if (parent && parent->config.splitShare) {
+  //启动 proxy 服务线程，之后可以使用 proxy 相关调用
+  if (parent && parent->config.splitShare) {//如果有父通信器且配置了 splitShare（共享 proxy 状态），则复用父通信器的 proxy 状态。
     comm->proxyState = parent->sharedRes->proxyState;
-    ncclAtomicRefCountIncrement(&parent->sharedRes->proxyState->refCount);
+    ncclAtomicRefCountIncrement(&parent->sharedRes->proxyState->refCount);//增加 proxyState 的引用计数，确保资源不会被提前释放。
   } else {
+    /*
+    在NCCL中，intra-node场景，GPU与GPU之间建立P2P transport，以及inter-node场景，通过NET建立NET transport的时候，都需要proxy线程的参与，
+    其实总共有两个proxy线程，一个叫做proxyService线程，是每个NODE中每个GPU对应的一个，主要维护连接建立， 用于transport的setup和connect阶段。
+    另一个叫做proxyProgress线程，也是每个NODE中每个GPU对应的一个，主要在inter-node通信过程中，处理kernel和IB之间的数据交互
+    这里的就是proxyService。
+    这里先是用一个线程去做这件事，这个线程先监听，以接收所有可能来的连接，然后根据连接发过来的请求信息来进行相应的操作。
+    */
     NCCLCHECKGOTO(ncclProxyCreate(comm), ret, fail);
   }
   NCCLCHECKGOTO(ncclCalloc(&comm->gproxyConn, comm->nRanks), ret, fail);
 
   timers[TIMER_INIT_CONNECT] = clockNano();
-  do { // Build p2p schedule
+  /*
+  这段代码是为每个 rank 预先安排好它将要发送和接收数据的 peer
+  确保所有 rank 被均匀调度
+  支持多节点与单节点的不同拓扑结构
+  在进程分布不均时自动退化为“扁平”模式
+
+  就是生成一个round（nrank）大小的调度表，这个调度表里面存的是peer rank的信息，规定了当前rank与哪些rank进行send和receive
+  
+  */
+  do { // Build p2p schedule  
     int node = comm->node;
     int nNodes = comm->nNodes;
     int nRanks = comm->nRanks;
     int local = comm->localRank;
     int nLocals = comm->maxLocalRanks;
     struct ncclNodeRanks* nodeRanks = comm->nodeRanks;
-    bool flat = false;
+    bool flat = false;//判断所有node的localRanks是否都相同，为true的时候表示不相同
+    /*
+    当检测到每个 node 的 localRanks 数量不一致时，说明各节点上的进程分布不均匀，无法按照标准的分层（node-local）P2P 通信调度方式进行。
+    此时，将 nNodes 赋值为 1、nLocals 赋值为 nRanks，并将 flat 设为 true，表示所有进程被视为同一组（即“扁平”模式），
+    后续调度逻辑会退化为全局范围内的简单遍历，而不再区分节点和本地 rank。这样可以保证即使节点分布不均，也能生成一个完整有效的通信调度表。
+    */
     for (int node = 0; node < nNodes; node++) {
       if (nodeRanks[node].localRanks != nLocals) {
         flat = true;
@@ -1140,8 +1169,11 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
         break;
       }
     }
+    //分别为大于等于节点数和本地 rank 数的最小2的幂。
     int nNodesPow2 = pow2Up(nNodes);
     int nLocalsPow2 = pow2Up(nLocals);
+    //comm->p2pSchedule 和 comm->planner.peers 分别分配用于存储调度信息的内存。
+    //分配nRanks个P2pSchedulePair和Peer
     comm->p2pSchedule = ncclMemoryStackAlloc<ncclComm::P2pSchedulePair>(&comm->memPermanent, nRanks);
     comm->planner.peers = ncclMemoryStackAlloc<ncclKernelPlanner::Peer>(&comm->memPermanent, nRanks);
     uint32_t nodeRound = 0;
@@ -1151,6 +1183,18 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     // Since that formula only produces valid permutations when N is a pow of 2,
     // we let N = pow2Up(n) and filter out results greater-eq to n.
     // Example sequence for 16 ranks: 0, 1, 3, 6, 10, 15, 5, 12, 4, 13, 7, 2, 14, 11, 9, 8
+    /*
+    本段代码用于枚举 peer delta（通信对之间的距离），采用二次公式 (x*x+x)/2 mod N。只有当 N 为 2 的幂时，
+    该公式才能生成有效的排列，因此实际使用时 N 取大于等于 n 的最小 2 的幂，并过滤掉大于等于 n 的结果。给出了 16 个 rank 时的示例序列。
+    - 最开始生成的local与local进行通信，这个会被pass掉
+    - 随后就是local与local+1,local-1进行通信（send和receive）
+假设有2个节点，每个节点有两个rank：当前节点是node 0的rank 0，那么他的send和receive rank如下所示
+    round	sendRank	recvRank
+      0	    0	      0 //这种情况应该是被忽略的。
+      1	    1	      1
+      2	    2	      2
+      3	    3	      3
+    */
     do {
       if (nodeDelta < nNodes) { // Filter nonsensical node deltas
         int sendNode = (node + nodeDelta) % nNodes;
@@ -1158,28 +1202,31 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
         uint32_t localRound = 0;
         uint32_t localDelta = 0;
         do {
-          if (localDelta < nLocals) { // Filter nonsensical node-local deltas
+          if (localDelta < nLocals) { // Filter nonsensical node-local deltas 只处理有效的节点间 delta
             int sendLocal = (local + localDelta) % nLocals;
             int recvLocal = (local - localDelta + nLocals) % nLocals;
+            //让每个 rank 找到自己应该发送给谁、从谁那里接收数据
             comm->p2pSchedule[round].sendRank = flat ? sendLocal : nodeRanks[sendNode].localRankToRank[sendLocal];
             comm->p2pSchedule[round].recvRank = flat ? recvLocal : nodeRanks[recvNode].localRankToRank[recvLocal];
             round += 1;
           }
           localRound += 1;
           localDelta = (localDelta + localRound) & (nLocalsPow2 - 1); // Quadratic update
-        } while (localRound != nLocalsPow2);
+        } while (localRound != nLocalsPow2);//内层：本地 rank 维度（Local rank-level）
+
       }
       nodeRound += 1;
-      nodeDelta = (nodeDelta + nodeRound) & (nNodesPow2 - 1); // Quadratic update
-    } while (nodeRound != nNodesPow2);
+      nodeDelta = (nodeDelta + nodeRound) & (nNodesPow2 - 1); // Quadratic update 用二次公式生成下一个本地 delta
+    } while (nodeRound != nNodesPow2); //外层：节点维度（Node-level）
 
-    if (round != nRanks) {
+
+    if (round != nRanks) {//如果最终生成的 round 数不等于总 rank 数，说明调度有问题，发出警告并跳转到错误处理
       WARN("P2p schedule creation has bugs.");
       ret = ncclInternalError;
       goto fail;
     }
   } while (0);
-
+  //Dynamically connect peers during runtime 
   comm->runtimeConn = comm->cuMemSupport && ncclParamRuntimeConnect();
   if (comm->runtimeConn) {
     for (int c=0; c<comm->nChannels; c++) {
@@ -1193,6 +1240,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     for (int c=0; c<comm->nChannels; c++) {
       NCCLCHECKGOTO(setupChannel(comm, c, rank, nranks, rings+c*nranks), ret, fail);
     }
+    //如果不支持运行时连接，则在初始化阶段就建立所有通信对的连接。
     NCCLCHECKGOTO(ncclTransportRingConnect(comm), ret, fail);
 
     // Connect Trees

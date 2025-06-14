@@ -1,7 +1,7 @@
 #include "comm.h"
 #include "transport.h"
 #include "bootstrap.h"
-
+//用于初始化和连接 NCCL中的 P2P 环形拓扑结构，以便进行高效的设备间通信。
 ncclResult_t ncclTransportRingConnect(struct ncclComm* comm) {
   struct ringConnInfo {
     bool useNetPXN;
@@ -10,14 +10,18 @@ ncclResult_t ncclTransportRingConnect(struct ncclComm* comm) {
   struct ringConnInfo* ringInfo = NULL;
   ncclResult_t ret = ncclSuccess;
   if (comm && comm->nRanks > 1) {
-    comm->useGdr = true;
-    comm->useNetPXN = false;
+    comm->useGdr = true;//表示启用 GPU 直接读取 (GDR) 模式。
+    comm->useNetPXN = false;//表示暂时不使用网络 PXN（PCIe 交换网络）模式。
+
+    //简单来说就是遍历所有的channel，设置一下当前rank所可能连接的peer的channel掩码，如果掩码为0，那么说明就不应该连接这个peer
+    //而这里则是根据ring去设置的
     for (int c = 0; c < comm->nChannels; c++) {
       struct ncclChannel* channel = comm->channels + c;
+      //设置当前rank下对pre和next rank的每个channel的掩码信息
       NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &channel->ring.prev, 1, &channel->ring.next, 0), ret, fail);
     }
     NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], 0), ret, fail);
-    if (ncclParamLocalRegister() || ncclParamGraphRegister()) {
+    if (ncclParamLocalRegister() || ncclParamGraphRegister()) {//判断是否启用本地或图注册机制
       NCCLCHECK(ncclCalloc(&ringInfo, comm->nRanks));
       ringInfo[comm->rank].useGdr = comm->useGdr;
       ringInfo[comm->rank].useNetPXN = comm->useNetPXN;

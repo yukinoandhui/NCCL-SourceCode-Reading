@@ -25,7 +25,7 @@ void dumpLine(int* values, int nranks, const char* prefix) {
   }
   INFO(NCCL_INIT, "%s", line);
 }
-// nrings其实就是nchannels
+// nrings其实就是nchannels 以当前的rank为起点构建环
 ncclResult_t ncclBuildRings(int nrings, int* rings, int rank, int nranks, int* prev, int* next) {
   for (int r=0; r<nrings; r++) {
     char prefix[40];

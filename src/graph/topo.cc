@@ -1579,21 +1579,21 @@ static ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, in
   *localCount = count;
   return ncclSuccess;
 }
-
+//用于根据 GPU 到 CPU 的带宽，估算该 GPU 需要多少个本地网络接口（NIC）才能充分利用其带宽
 ncclResult_t getLocalNetCountByBw(struct ncclTopoSystem* system, int gpu, int *count) {
-  int localNetCount = 0, netCountByBw = 0;
-  int localNets[NCCL_TOPO_MAX_NODES];
+  int localNetCount = 0, netCountByBw = 0;//初始化本地网络数量和按带宽计数的网络数量。
+  int localNets[NCCL_TOPO_MAX_NODES];//用于存储本地可用的网络节点索引。
   float totalNetBw = 0, gpuBw = 0;
 
   for (int l=0; l<system->nodes[GPU].nodes[gpu].nlinks; l++) {
     //assuming BW to CPU reflects the GPU bandwidth via P2P or C2C
     //caveat, this could be wrong if there is a PCIe switch,
-    //and a narrower link to the CPU
+    //and a narrower link to the CPU 如果链路的远端节点类型是 CPU，则认为该链路带宽代表 GPU 的总带宽（假设 P2P 或 C2C 直连）。
     if (system->nodes[GPU].nodes[gpu].links[l].remNode->type == CPU) {
        gpuBw = system->nodes[GPU].nodes[gpu].links[l].bw;
     }
   }
-
+//获取该 GPU 直连的所有网络接口（NIC）中路径最优的几个。统计需要多少个 NIC 才能满足 GPU 带宽。
   NCCLCHECK(ncclTopoGetLocal(system, GPU, gpu, NET, localNets, &localNetCount, NULL));
   for (int l=0; (l < localNetCount) && (totalNetBw < gpuBw); l++, netCountByBw++) {
      totalNetBw += system->nodes[GPU].nodes[gpu].paths[NET][localNets[l]].bw;

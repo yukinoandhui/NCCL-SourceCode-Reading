@@ -101,7 +101,7 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 #define NCCL_IPC_REG_BUFFER 0x01
 #define NCCL_NVLS_REG_BUFFER 0x02
 #define NCCL_NET_REG_BUFFER 0x04
-
+//通信过程上下文信息
 struct ncclConnInfo {
   // Regular comm mechanism
   char *buffs[NCCL_NUM_PROTOCOLS]; // Local for recv, remote for send
@@ -133,10 +133,10 @@ struct ncclProxyConnector {
 };
 
 struct ncclConnector {
-  int connected;
+  int connected;//是否完成连接的建立
   struct ncclProxyConnector proxyConn;
   struct ncclTransportComm* transportComm;
-  void* transportResources;
+  void* transportResources;//transportResources为通信过程中用到的buffer
   struct ncclConnInfo conn;
 };
 
@@ -148,7 +148,7 @@ struct ncclRing {
   // Maps an internal nccl index to user-specified rank order. This is necessary
   // since we need to know how the user expects data to be ordered across
   // devices. Ordered from current device.
-  int* userRanks;
+  int* userRanks; //以当前rank为起点的环的rank顺序。
 
   int index; // This rank's index in the ring
 };
@@ -360,7 +360,7 @@ struct alignas(16) ncclDevWorkBatch {
   // For each bit index i in offsetMask, find work at fifo offset: offsetBase + i*sizeof(WorkStructType)
   uint64_t offsetBitset;
 };
-
+//注意这里和ncclChannelPeer的区别，这里简化了信息，只存了 ncclConnInfo，而没有存储完整的 ncclConnector 结构体。
 struct ncclDevChannelPeer {
   // Stripped version of ncclChannelPeer where we only keep the ncclConnInfo
   // instead of the full ncclConnector.

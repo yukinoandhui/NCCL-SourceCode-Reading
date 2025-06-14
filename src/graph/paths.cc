@@ -851,39 +851,41 @@ void ncclTopoFree(struct ncclTopoSystem* system) {
 }
 
 NCCL_PARAM(NChannelsPerNetPeer, "NCHANNELS_PER_NET_PEER", -1);
-
+//对于local gpu，通道最低是2
 static ncclResult_t ncclTopoGetNchannels(struct ncclComm* comm, int g /*local gpu index*/, int peerRank, int* nChannels) {
   int peer;
   struct ncclTopoSystem* system = comm->topo;
   struct ncclTopoLinkList* path = NULL;
+  //说明是local rank
   if (ncclTopoRankToIndex(system, peerRank, &peer) == ncclSuccess) {
     // Same rank
     if (g == peer) {
       *nChannels = -1;
       return ncclSuccess;
     }
-    // Local rank
+    // Local rank。 
     path = system->nodes[GPU].nodes[peer].paths[GPU]+g;
-    if (path->type == PATH_NVL) {
+    if (path->type == PATH_NVL) {// 那么如果路径是nvlink，则
       float nvlBw = ncclTopoNVLinkBw(system->nodes[GPU].nodes[g].gpu.cudaCompCap);
-      *nChannels = 2*std::max(1, (int)(path->bw / nvlBw));
+      *nChannels = 2*std::max(1, (int)(path->bw / nvlBw));// 计算需要的通道数，带宽越大通道越多，至少为 2
     } else {
       *nChannels = 2;
     }
   } else {
     // Remote rank, use network
-    int nNetChannels = ncclParamNChannelsPerNetPeer();
+    int nNetChannels = ncclParamNChannelsPerNetPeer();// 获取每个网络 peer 的通道数参数
     if (nNetChannels == -1) {
-       //start from 2 channels per NIC and reduce with scale
+       //start from 2 channels per NIC and reduce with scale  默认每个 NIC 2 个通道
        nNetChannels = 2;
 
        // check if we need to use more than one NIC, hence more than one channel
        int netCountByBw = 1, nChannelsMax = nNetChannels;
-       NCCLCHECK(getLocalNetCountByBw(system, g, &netCountByBw));
+       NCCLCHECK(getLocalNetCountByBw(system, g, &netCountByBw));// 根据带宽决定需要多少 NIC
        // Avoid overloading channels with 8+ operations as we loose the sync warp, hence a bit of bandwidth.
-       while (nChannelsMax*comm->nRanks > comm->p2pnChannels*4 && nChannelsMax > 1) nChannelsMax /= 2;
+       //避免在单个通道中执行8次以上操作，否则会导致同步线程束（warp）失效，从而损失部分带宽.警告开发者若单个通道（channel）同时处理过多操作（如内存访问），会导致线程束内的线程无法同步执行（warp divergence），进而降低并行效率。
+       while (nChannelsMax*comm->nRanks > comm->p2pnChannels*4 && nChannelsMax > 1) nChannelsMax /= 2;// 防止通道数过多导致带宽浪费
 
-       //allow upto channels requires to drive the NICs
+       //allow upto channels requires to drive the NICs 允许按需分配通道以驱动网卡（NIC）
        nNetChannels = std::max(netCountByBw, nChannelsMax);
     }
     *nChannels = nNetChannels;
@@ -894,7 +896,7 @@ static ncclResult_t ncclTopoGetNchannels(struct ncclComm* comm, int g /*local gp
 NCCL_PARAM(MinP2pNChannels, "MIN_P2P_NCHANNELS", 1);
 NCCL_PARAM(MaxP2pNChannels, "MAX_P2P_NCHANNELS", MAXCHANNELS);
 extern int64_t ncclParamWorkArgsBytes();
-
+//根据com的channel数和环境变量来设置p2p的channel数
 ncclResult_t ncclTopoComputeP2pChannels(struct ncclComm* comm) {
   /* here we already honor comm->max/minCTAs for p2pnChannels. */
   if (comm->sharedRes->owner != comm) {
@@ -910,15 +912,16 @@ ncclResult_t ncclTopoComputeP2pChannels(struct ncclComm* comm) {
   for (int g=0; g<comm->topo->nodes[GPU].count; g++) {
     for (int r=0; r<comm->nRanks; r++) {
       int nChannels;
+      // 获取 g 到 r 的可用通道数，对于local gpu，至少两个通道
       NCCLCHECK(ncclTopoGetNchannels(comm, g, r, &nChannels));
-      if (nChannels >= 0) minChannels = std::min(minChannels, nChannels);
+      if (nChannels >= 0) minChannels = std::min(minChannels, nChannels);// 取所有 GPU/rank 组合中的最小通道数
     }
   }
 
   // Make nChannelsPerPeer and nChannels powers of 2. This is relied on when
   // mapping p2p peers to channels.
-  comm->p2pnChannelsPerPeer = pow2Up(minChannels);
-  comm->p2pnChannels = pow2Up(comm->p2pnChannels);
+  comm->p2pnChannelsPerPeer = pow2Up(minChannels);// 将 minChannels 向上取整为 2 的幂
+  comm->p2pnChannels = pow2Up(comm->p2pnChannels);// p2pnChannels 也向上取整为 2 的幂
 
   comm->p2pnChannels = std::min(comm->p2pnChannels, pow2Down(ncclDevMaxChannelsForArgsBytes(ncclParamWorkArgsBytes())));
   comm->p2pnChannelsPerPeer = std::min(comm->p2pnChannelsPerPeer, comm->p2pnChannels);

@@ -971,6 +971,7 @@ fail:
   (void)ncclSocketClose(sock);
   return ret;
 }
+//连接到peer，并向peer发送data数据
 ncclResult_t bootstrapSend(void* commState, int peer, int tag, void* data, int size) {
   ncclResult_t ret = ncclSuccess;
   struct ncclSocket sock;

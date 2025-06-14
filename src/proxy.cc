@@ -164,7 +164,15 @@ static ncclResult_t asyncProxyOpEnqueue(struct ncclProxyLocalPeer* peer, ncclPro
   list->next = op;
   return ncclSuccess;
 }
-
+//这个函数的作用是从一个给定的 peer 的异步操作链表中移除指定的异步操作 op。
+/*
+一旦找到匹配的节点：
+如果该节点是链表的第一个节点，则将 peer->asyncOps 指向下一个节点。
+否则，将前一个节点的 next 指针指向当前节点的下一个节点，从而从链表中移除当前节点。
+接着释放该节点关联的内存资源：
+释放 reqBuff（请求缓冲区）和 respBuff（响应缓冲区）。
+最后释放该异步操作节点本身的内存。
+*/
 static ncclResult_t asyncProxyOpDequeue(struct ncclProxyLocalPeer* peer, ncclProxyAsyncOp* op) {
   struct ncclProxyAsyncOp* elem = peer->asyncOps;
   struct ncclProxyAsyncOp* prev = NULL;
@@ -838,13 +846,15 @@ void ncclDumpProxyState(int signal) {
 }
 
 NCCL_PARAM(CreateThreadContext, "CREATE_THREAD_CONTEXT", 0);
+//负责为 NCCL 代理线程创建或切换到专属的 CUDA 上下文（context），以保证代理线程在正确的 CUDA 设备和上下文下执行。
 static int setProxyThreadContext(struct ncclProxyState* proxyState) {
 #if CUDART_VERSION >= 11030
   static int createThreadContext = -1;
 
-  if (createThreadContext == -1) {
+  if (createThreadContext == -1) {//第一次调用
     createThreadContext = ncclParamCreateThreadContext();
     if (createThreadContext) {
+      //检查当前驱动是否支持相关 CUDA 上下文 API（ cuCtxCreate 、 cuCtxDestroy 、 cuCtxSetCurrent ），若不支持则禁用该功能
       if (CUPFN(cuCtxCreate) == nullptr || CUPFN(cuCtxDestroy) == nullptr || CUPFN(cuCtxSetCurrent) == nullptr) {
         WARN("Unable to create thread context due to old driver, disabling.");
         createThreadContext = 0;
@@ -852,7 +862,7 @@ static int setProxyThreadContext(struct ncclProxyState* proxyState) {
       }
     }
   }
-  if (createThreadContext) {
+  if (createThreadContext) {//若需要创建线程上下文
     if (proxyState->cudaCtx == NULL) {
       if (CUPFN(cuCtxCreate(&proxyState->cudaCtx,
                             NULL, 0, CU_CTX_SCHED_SPIN|CU_CTX_MAP_HOST, proxyState->cudaDev)) != CUDA_SUCCESS) {
@@ -1421,7 +1431,10 @@ error:
   return ncclInternalError;
 #endif
 }
-
+/*
+*代理线程处理异步操作。
+*
+*/
 static ncclResult_t proxyProgressAsync(struct ncclProxyAsyncOp* op, struct ncclProxyState* proxyState, int* asyncOpCount, struct ncclProxyLocalPeer* peer, struct ncclProxyConnectionPool* connectionPool) {
   int done = 1;
   ncclResult_t res = ncclInternalError;
@@ -1536,10 +1549,13 @@ enum {
   PROXY_STOP = 1,
   PROXY_ABORT = 2
 };
-
+/*
+每个NODE中每个GPU对应的一个，主要维护连接建立， 用于transport的setup和connect阶段
+*/
 void* ncclProxyService(void* _args) {
   struct ncclProxyState* proxyState =  (struct ncclProxyState*) _args;
   // if (CPU_COUNT(&comm->cpuAffinity)) sched_setaffinity(0, sizeof(cpu_set_t), &comm->cpuAffinity);
+  //首先为代理线程设置 CUDA 设备上下文（setProxyThreadContext 或 cudaSetDevice），确保后续 CUDA 操作在正确的设备上执行。
   if (setProxyThreadContext(proxyState)) {
     INFO(NCCL_INIT, "[Proxy Service] Created CUDA context on device %d", proxyState->cudaDev);
   } else if (cudaSetDevice(proxyState->cudaDev) != cudaSuccess) {
@@ -1549,19 +1565,20 @@ void* ncclProxyService(void* _args) {
 
   INFO(NCCL_INIT, "[Proxy Service] Device %d CPU core %d", proxyState->cudaDev, sched_getcpu());
 
-  // Prepare poll descriptor
+  // Prepare poll descriptor 初始化连接池 connectionPool ，用于管理所有 socket 连接
   struct ncclProxyConnectionPool connectionPool;
   connectionPool.pools = NULL;
   connectionPool.banks = 0;
   connectionPool.offset = NCCL_PROXY_CONN_POOL_SIZE;
-
-  struct pollfd pollfds[NCCL_MAX_PROXY_CONNECTIONS+1]; // one extra for listenSock fd
+  //初始化 pollfd 数组和本地 peer 数组 peers ，为每个可能的连接分配轮询描述符。
+  struct pollfd pollfds[NCCL_MAX_PROXY_CONNECTIONS+1]; // one extra for listenSock fd 为监听套接字预留一个位置（经典写法）
   struct ncclProxyLocalPeer peers[NCCL_MAX_PROXY_CONNECTIONS];
   memset(&peers, 0, sizeof(struct ncclProxyLocalPeer)*NCCL_MAX_PROXY_CONNECTIONS);
   for (int s=0; s<NCCL_MAX_PROXY_CONNECTIONS; s++) {
     pollfds[s].fd = -1;
     pollfds[s].events = POLLHUP|POLLIN;
   }
+  //获取监听套接字的文件描述符，并将其添加到轮询描述符数组中。放到最后一个位置
   if (ncclSocketGetFd(proxyState->listenSock, &pollfds[NCCL_MAX_PROXY_CONNECTIONS].fd) != ncclSuccess) {
     WARN("[Proxy Service] Get listenSock fd fails");
     return NULL;
@@ -1572,37 +1589,42 @@ void* ncclProxyService(void* _args) {
   int npeers = 0;
   int stop = PROXY_RUNNING;
   int asyncOpCount = 0;
-  while (stop == PROXY_RUNNING || npeers > 0) {
+  while (stop == PROXY_RUNNING || npeers > 0) {//只要 stop 状态为运行中或还有活跃 peer，循环持续。
     /* Even if local comm aborts, we cannot let proxy thread exit if we still have peer
      * connections. Need to wait until all other related comms call abort and safely exit
-     * together, or we could face segmentation fault. */
-    if (__atomic_load_n(proxyState->abortFlag, __ATOMIC_ACQUIRE) != 0) stop = PROXY_ABORT;
+     * together, or we could face segmentation fault. 
+     即使本地通信（local comm）被中止，只要仍存在对等连接（peer connections），就不能让代理线程退出。
+     必须等待所有其他关联的通信（comms）调用中止并安全地一起退出，否则可能会引发段错误（segmentation fault）。​
+     */
+    if (__atomic_load_n(proxyState->abortFlag, __ATOMIC_ACQUIRE) != 0) stop = PROXY_ABORT;//检查 abortFlag，若被置位则进入终止流程
     /* never let proxy service thread blocks in poll, or it cannot receive abortFlag. */
     int ret;
     do {
       // poll all fds including the listenSock
       ret = poll(pollfds, NCCL_MAX_PROXY_CONNECTIONS+1, asyncOpCount ? 0 : 500);
-    } while (ret < 0 && errno == EINTR);
+    } while (ret < 0 && errno == EINTR);//errno 是 C/C++ 标准库中用于​​报告系统调用和库函数错误​​的全局变量（通常定义为 int 类型）。当函数执行失败时，系统会通过设置 errno 来指示具体的错误原因，开发者可通过检查 errno 定位问题。	这里是系统调用被信号中断
+    // 上面while的逻辑是仅重试可恢复的中断错误
     if (ret < 0) {
       WARN("[Proxy Service] Poll failed: %s", strerror(errno));
       return NULL;
     }
+    //accept获取新连接的套接字
     if (pollfds[NCCL_MAX_PROXY_CONNECTIONS].revents) {
-      // We got an event on the listenSock
+      // We got an event on the listenSock 若监听 socket 有事件，说明有新连接到来，分配 peer 结构、初始化 socket、accept 连接、获取 fd、peer 数量加一。
       int s = 0;
-      while (s < NCCL_MAX_PROXY_CONNECTIONS && pollfds[s].fd >= 0) s++;
+      while (s < NCCL_MAX_PROXY_CONNECTIONS && pollfds[s].fd >= 0) s++;//找到第一个空闲的位置。
       if (s == NCCL_MAX_PROXY_CONNECTIONS) {
         WARN("[Proxy service] Too many connections (%d max)", NCCL_MAX_PROXY_CONNECTIONS);
         return NULL;
       }
-      if (maxnpeers < s+1) maxnpeers = s+1;
+      if (maxnpeers < s+1) maxnpeers = s+1;//更新最大 peer 数量
       if (ncclSocketInit(&peers[s].sock) != ncclSuccess) {
         WARN("[Service thread] Initialize peers[%d].sock fails", s);
         return NULL;
       }
-      if (ncclSocketAccept(&peers[s].sock, proxyState->listenSock) != ncclSuccess) {
+      if (ncclSocketAccept(&peers[s].sock, proxyState->listenSock) != ncclSuccess) {//accept 连接
         WARN("[Service thread] Accept failed %s", strerror(errno));
-      } else {
+      } else {//accept的fd
         if (ncclSocketGetFd(&peers[s].sock, &pollfds[s].fd) != ncclSuccess) {
           WARN("[Service thread] Get peers[%d].sock fd fails", s);
           return NULL;
@@ -1611,6 +1633,7 @@ void* ncclProxyService(void* _args) {
         peers[s].tpLocalRank = -1;
       }
     }
+    //轮询所有连接，
     for (int s=0; s<maxnpeers; s++) {
       struct ncclProxyLocalPeer* peer = peers+s;
       struct ncclSocket* sock = &peer->sock;
@@ -1622,12 +1645,18 @@ void* ncclProxyService(void* _args) {
       // Progress all ops for this ncclProxyLocalPeer
       if (stop == PROXY_ABORT && ncclCuMemEnable() && ncclCuMemHostEnable() && !proxyState->directMode && __atomic_load_n(&proxyState->stop, __ATOMIC_ACQUIRE)) closeConn = 1;
       ncclProxyAsyncOp* op = peer->asyncOps;
+      //推进该 peer 的所有异步操作队列（proxyProgressAsync），若遇到错误则关闭连接。
       while (op != nullptr) {
         ncclProxyAsyncOp* opnext = op->next; /* in case op is freed in proxyProgressAsync */
         type = op->type;
         // Coverity gets confused here by complex code structure.  Yes, connectionPool.pools gets dereferenced, and
         // while calling proxyProgressAsync() connectionPool.pools is NULL, but that changes before it's dereferenced.
         // coverity[var_deref_model:FALSE]
+        /*
+        指出静态分析工具Coverity因代码结构复杂产生了误报
+        承认确实存在解引用操作，但强调NULL检查的时序问题：虽然某个时刻变量为NULL，但在实际使用前已被正确赋值
+        最后是专门给Coverity的指令标记，表示需要忽略这个解引用模型的误报
+        */
         res = proxyProgressAsync(op, proxyState, &asyncOpCount, peer, &connectionPool);
         if (res == ncclSuccess || res == ncclInProgress) {
           op = opnext;
@@ -1639,10 +1668,12 @@ void* ncclProxyService(void* _args) {
         }
       }
 
-      // Check for additional ops coming in
+      // Check for additional ops coming in 使用 poll() 检查是否有数据可读（即有新的命令从 peer 发来）。
       if (pollfds[s].revents & POLLIN) {
         int closed;
+        //接收type类型
         res = ncclSocketTryRecv(sock, &type, sizeof(int), &closed, false /*blocking*/);
+        //如果接收失败且不是“暂时无数据”，则记录警告并准备关闭连接。
         if (res != ncclSuccess && res != ncclInProgress) {
           if (!__atomic_load_n(proxyState->abortFlag, __ATOMIC_RELAXED))
             WARN("[Service thread] Could not receive type from localRank %d, res=%u, closed=%d", peer->tpLocalRank, res, closed);
@@ -1656,7 +1687,7 @@ void* ncclProxyService(void* _args) {
             closeConn = 1;
           } else if (type == ncclProxyMsgClose) {
             closeConn = 1;
-          } else if (proxyMatchOpType(type)) {
+          } else if (proxyMatchOpType(type)) {//如果是合法的操作类型(并且不是stop和close),则启动操作
             res = proxyServiceInitOp(type, peers+s, &connectionPool, proxyState, &asyncOpCount);
           } else {
             WARN("[Service thread] Unknown command %d from localRank %d", type, peer->tpLocalRank);
@@ -1668,6 +1699,7 @@ void* ncclProxyService(void* _args) {
       } else if (pollfds[s].revents & POLLHUP) {
         closeConn = 1;
       }
+      //执行失败
       if (res != ncclSuccess && res != ncclInProgress) {
         if (!__atomic_load_n(proxyState->abortFlag, __ATOMIC_RELAXED))
           WARN("[Proxy Service %d] Failed to execute operation %s from rank %d, retcode %d", proxyState->tpRank, ncclProxyMsgTypeStr[type], peer->tpRank, res);
@@ -1675,10 +1707,10 @@ void* ncclProxyService(void* _args) {
       }
 
       if (closeConn) {
-        (void)ncclSocketClose(sock);
+        (void)ncclSocketClose(sock);//关闭 socket
 
         if (op != nullptr) {
-          asyncProxyOpDequeue(peer, op);
+          asyncProxyOpDequeue(peer, op);//如果还有未完成的异步操作，将其从队列中移除(由于某种原因，前面处理了，但是可能没处理成功)
           asyncOpCount--;
         }
         pollfds[s].fd = -1;
@@ -1687,13 +1719,17 @@ void* ncclProxyService(void* _args) {
     }
   }
 
-  // Wait for all operations to complete and stop progress thread before freeing any resource
+  // Wait for all operations to complete and stop progress thread before freeing any 
+  //停止用于处理异步操作的进度线程（progress thread），并等待该线程退出。这一步确保了在释放其他资源之前，所有的异步操作都已完成。
   if (ncclProxyProgressDestroy(proxyState) != ncclSuccess) {
     WARN("[Proxy Service] proxyDestroy failed");
   }
+  //关闭所有本地连接套接字
   for (int s=0; s<maxnpeers; s++) {
-    (void)ncclSocketClose(&peers[s].sock);
+    
+    (void)ncclSocketClose(&peers[s].sock);//(void) 是为了避免编译器因未使用返回值而报错。
   }
+  //释放代理连接池
   ncclProxyFreeConnections(&connectionPool, proxyState);
   (void)ncclSocketClose(proxyState->listenSock);
   free(proxyState->listenSock);
@@ -1813,7 +1849,7 @@ ncclResult_t ncclProxyCreate(struct ncclComm* comm) {
     PTHREADCHECK(pthread_create(&comm->proxyState->thread, NULL, ncclProxyService, comm->proxyState), "pthread_create");
     ncclSetThreadName(comm->proxyState->thread, "NCCL Service %2d", comm->cudaDev);
 
-    // UDS support
+    // UDS support UDS线程
     INFO(NCCL_PROXY, "UDS: Creating service thread comm %p rank %d", comm, comm->rank);
     PTHREADCHECK(pthread_create(&comm->proxyState->threadUDS, NULL, ncclProxyServiceUDS, comm->proxyState), "pthread_create");
     ncclSetThreadName(comm->proxyState->threadUDS, "NCCL UDS Service %2d", comm->cudaDev);

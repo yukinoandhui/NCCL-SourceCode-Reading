@@ -198,13 +198,15 @@ ncclResult_t ncclStrongStreamAcquire(
   #endif
   return ncclSuccess;
 }
-
+//主要用于在 NCCL 内部管理 CUDA Stream 的捕获状态，确保后续在该 stream 上添加的操作不会与 CUDA Graph 捕获冲突。
 ncclResult_t ncclStrongStreamAcquireUncaptured(struct ncclStrongStream* ss) {
   #if CUDART_VERSION >= 11030
-    bool mixing = ncclParamGraphMixingSupport();
-    if (mixing && ss->everCaptured) {
+    bool mixing = ncclParamGraphMixingSupport(); //判断是否支持 Graph Mixing（即 CUDA Graph 与普通 stream 操作混合）。
+    if (mixing && ss->everCaptured) {//如果支持 mixing 且该 stream 曾经被 CUDA Graph 捕获过
+      //让当前 stream 等待 serialEvent ，确保串行化依赖。
       CUDACHECK(cudaStreamWaitEvent(ss->cudaStream, ss->serialEvent, 0));
     }
+    //设置 ss->serialEventNeedsRecord = true ，假设调用者会在该 stream 上添加新的操作，需要在后续记录 event。
     ss->serialEventNeedsRecord = true; // Assume the caller is going to add work to stream.
   #endif
   return ncclSuccess;
@@ -217,20 +219,21 @@ static ncclResult_t checkGraphId(struct ncclStrongStreamGraph* g, unsigned long 
   }
   return ncclSuccess;
 }
-
+//其作用是在 NCCL 使用完 strong stream 后，记录同步事件（serialEvent），以保证后续操作的顺序性。
 ncclResult_t ncclStrongStreamRelease(struct ncclCudaGraph graph, struct ncclStrongStream* ss) {
   #if CUDART_VERSION >= 11030
     bool mixing = ncclParamGraphMixingSupport();
     if (mixing && ss->serialEventNeedsRecord) {
       if (graph.graph == nullptr) {
-        if (ss->everCaptured) {
+        if (ss->everCaptured) {//如果当前 strong stream 曾经被 Graph 捕获过（ everCaptured ），就在当前 stream 上记录一个 event（ cudaEventRecord ），表示本次操作的结束点。
           CUDACHECK(cudaEventRecord(ss->serialEvent, ss->cudaStream));
-          ss->serialEventNeedsRecord = false;
+          ss->serialEventNeedsRecord = false;//置为 false，表示已经完成记录
         }
       } else {
-        struct ncclStrongStreamGraph* g = ss->graphHead;
-        NCCLCHECK(checkGraphId(g, graph.graphId));
+        struct ncclStrongStreamGraph* g = ss->graphHead;//通过 ss->graphHead 获取当前 strong stream 关联的 graph 信息
+        NCCLCHECK(checkGraphId(g, graph.graphId));//检查 graph id 是否匹配，并确保 tip 节点数量为 1
         ensureTips(g, 1);
+        //在 CUDA Graph 里添加一个 EventRecord 节点，记录 serialEvent。
         CUDACHECK(cudaGraphAddEventRecordNode(&g->tipNodes[0], graph.graph, g->tipNodes, g->tipCount, ss->serialEvent));
         g->tipCount = 1;
         ss->serialEventNeedsRecord = false;

@@ -282,18 +282,22 @@ static inline ncclResult_t ncclCuMemFreeAddr(void *ptr) {
 template <typename T>
 ncclResult_t ncclCudaMallocDebug(T** ptr, size_t nelem, const char *filefunc, int line) {
   ncclResult_t result = ncclSuccess;
-  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;//设置流捕获模式为 relaxed
   *ptr = nullptr;
-  CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+  /*
+  在多线程编程中，当多个线程需要​​协同捕获同一个 CUDA 流​​时，cudaThreadExchangeStreamCaptureMode 定义了线程之间如何传递和同步流捕获状态。
+  */
+  CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));//// 设置新模式，mode变量被更新为旧模式  
+  //// 执行需要临时模式的代码  
   if (nelem > 0) {
     if (ncclCuMemEnable()) {
       NCCLCHECKGOTO(ncclCuMemAlloc((void **)ptr, NULL, ncclCuMemHandleType, nelem*ncclSizeOfT<T>()), result, finish);
     } else {
-      CUDACHECKGOTO(cudaMalloc(ptr, nelem*ncclSizeOfT<T>()), result, finish);
     }
+    CUDACHECKGOTO(cudaMalloc(ptr, nelem*ncclSizeOfT<T>()), result, finish);
   }
 finish:
-  CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+  CUDACHECK(cudaThreadExchangeStreamCaptureMode(&mode));//// 恢复原始模式  
   if (*ptr == nullptr && nelem > 0) WARN("Failed to CUDA malloc %ld bytes", nelem*ncclSizeOfT<T>());
   INFO(NCCL_ALLOC, "%s:%d Cuda Alloc Size %ld pointer %p", filefunc, line, nelem*ncclSizeOfT<T>(), *ptr);
   return result;
@@ -337,7 +341,7 @@ ncclResult_t ncclCudaCallocAsyncDebug(T** ptr, size_t nelem, cudaStream_t stream
     if (ncclCuMemEnable()) {
       NCCLCHECKGOTO(ncclCuMemAlloc((void **)ptr, NULL, ncclCuMemHandleType, nelem*ncclSizeOfT<T>()), result, finish);
     } else {
-      CUDACHECKGOTO(cudaMalloc(ptr, nelem*ncclSizeOfT<T>()), result, finish);
+      CUDACHECKGOTO(cudaMalloc(ptr, nelem*ncclSizeOfT<T>()), result, finish);//不会捕获，但是Relaxed模式会允许执行
     }
     CUDACHECKGOTO(cudaMemsetAsync(*ptr, 0, nelem*ncclSizeOfT<T>(), stream), result, finish);
   }

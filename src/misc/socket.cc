@@ -922,7 +922,7 @@ ncclResult_t ncclSocketClose(struct ncclSocket* sock) {
   }
   return ncclSuccess;
 }
-
+//获取socket的fd
 ncclResult_t ncclSocketGetFd(struct ncclSocket* sock, int* fd) {
   if (sock == NULL) {
     WARN("ncclSocketGetFd: pass NULL socket");

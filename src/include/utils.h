@@ -186,28 +186,35 @@ template<typename T, T *T::*next>
 T* ncclIntruQueueMpscAbandon(struct ncclIntruQueueMpsc<T,next>* me);
 
 ////////////////////////////////////////////////////////////////////////////////
-
+/*
+Frame栈帧的结构，而栈帧又可以分为一系列Hunk。
+- Hunk ： Hunk 是内存堆栈中的一个基本单元，它通过 above 指针形成一个反向堆栈结构。每个 Hunk 包含一个 size 字段，表示当前分配的大小，包括头部结构。
+- Frame ： Frame 是一个管理堆栈帧的结构，包含一个指向当前非空 Hunk 的指针 hunk 。 Frame 通过 below 指针形成一个链表，允许在内存分配时进行回溯。
+- Unhunk 用于管理那些不在 Hunk 中分配的对象。它通过 next 指针形成一个链表， obj 指针指向实际分配的对象。这种设计允许在 Hunk 无法满足需求时进行灵活的内存分配。
+- bumper 和 end ：这两个字段用于管理内存分配的边界。 bumper 指向当前 Hunk 的位置（就是要分配下一个hunk的起点，简单来说就是指向已经分配位置的下一个）， end 表示 Hunk 的结束位置。通过这两个字段，可以有效地管理内存的分配和释放，确保内存不越界。
+这种设计的核心在于通过灵活的内存管理机制，减少内存碎片，提高内存分配效率，并提供对齐和大小的灵活支持。
+*/
 struct ncclMemoryStack {
   struct Hunk {
-    struct Hunk* above; // reverse stack pointer
-    size_t size; // size of this allocation (including this header struct)
+    struct Hunk* above; // reverse stack pointer 指向上一个 Hunk 的指针，形成一个反向的堆栈结构。
+    size_t size; // size of this allocation (including this header struct) 当前分配的大小，包括这个头部结构
   };
-  struct Unhunk { // proxy header for objects allocated out-of-hunk
-    struct Unhunk* next;
-    void* obj;
+  struct Unhunk { // proxy header for objects allocated out-of-hunk 用于管理那些不在 Hunk 中分配的对象
+    struct Unhunk* next; //指向下一个 Unhunk 的指针。
+    void* obj;//指向实际分配对象的指针
   };
   struct Frame {
-    struct Hunk* hunk; // top of non-empty hunks
-    uintptr_t bumper, end; // points into top hunk
-    struct Unhunk* unhunks;
-    struct Frame* below;
+    struct Hunk* hunk; // top of non-empty hunks 指向当前非空 Hunk 的顶部。
+    uintptr_t bumper, end; // points into top hunk 指向当前 Hunk 的位置，用于管理内存分配的边界。
+    struct Unhunk* unhunks;//指向 Unhunk 链表的头部。
+    struct Frame* below;//指向下一个 Frame
   };
 
   static void* allocateSpilled(struct ncclMemoryStack* me, size_t size, size_t align);
   static void* allocate(struct ncclMemoryStack* me, size_t size, size_t align);
 
-  struct Hunk stub;
-  struct Frame topFrame;
+  struct Hunk stub;//一个 Hunk 类型的成员，作为初始的占位符
+  struct Frame topFrame;//一个 Frame 类型的成员，表示当前的顶层 Frame
 };
 
 inline void ncclMemoryStackConstruct(struct ncclMemoryStack* me) {
@@ -221,10 +228,10 @@ inline void ncclMemoryStackConstruct(struct ncclMemoryStack* me) {
 }
 
 inline void* ncclMemoryStack::allocate(struct ncclMemoryStack* me, size_t size, size_t align) {
-  uintptr_t o = (me->topFrame.bumper + align-1) & -uintptr_t(align);
+  uintptr_t o = (me->topFrame.bumper + align-1) & -uintptr_t(align);//向上舍入到最接近的align的倍数,这是内存分配器中常见的对齐技术。
   void* obj;
-  if (__builtin_expect(o + size <= me->topFrame.end, true)) {
-    me->topFrame.bumper = o + size;
+  if (__builtin_expect(o + size <= me->topFrame.end, true)) {//如果不超过当前Frame的大小。
+    me->topFrame.bumper = o + size;//从o开始分配size大小的内存。bumper指向尾部
     obj = reinterpret_cast<void*>(o);
   } else {
     obj = allocateSpilled(me, size, align);

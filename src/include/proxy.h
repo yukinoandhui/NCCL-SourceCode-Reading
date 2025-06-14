@@ -247,16 +247,16 @@ struct ncclExpectedProxyResponse {
   ncclResult_t                      res;
   struct ncclExpectedProxyResponse* next;
 };
-
+//异步操作
 struct ncclProxyAsyncOp {
-  int type;
+  int type;//表示异步操作的类型，具体的值会定义不同的操作（例如，发送数据、接收数据等）。
   struct ncclProxyConnection* connection;
-  int reqSize, respSize;
-  char *reqBuff, *respBuff;
+  int reqSize, respSize;//分别表示请求和响应的大小。这通常用于网络通信，指示需要发送多少数据和期望接收多少数据。
+  char *reqBuff, *respBuff;//分别指向请求和响应的数据缓冲区。Proxy 线程会从 reqBuff 发送数据，并将接收到的数据存入 respBuff 。
   void* opId;
   ncclProxyAsyncOp* next;
 };
-
+//代表 Proxy 线程所管理的本地 Peer（对等方）的信息
 struct ncclProxyLocalPeer {
   struct ncclSocket sock;
   int tpRank;
@@ -365,19 +365,22 @@ ncclResult_t ncclProxyCreate(struct ncclComm* comm);
 ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, int proxyRank, struct ncclProxyConnector* proxyConn);
 
 // NB: ncclProxyMsgTypeStr[] in proxy.cc needs to match
+/*
+代理支持的消息类型
+*/
 enum ncclProxyMsgType {
-  ncclProxyMsgInit = 1,
-  ncclProxyMsgSharedInit = 2,
-  ncclProxyMsgSetup = 3,
-  ncclProxyMsgConnect = 4,
-  ncclProxyMsgStart = 5,
-  ncclProxyMsgClose = 6,
-  ncclProxyMsgAbort = 7,
-  ncclProxyMsgStop = 8,
-  ncclProxyMsgGetFd = 9, // cuMem API support (UDS)
-  ncclProxyMsgQueryFd = 10,
-  ncclProxyMsgRegister = 11,
-  ncclProxyMsgDeregister = 12
+  ncclProxyMsgInit = 1,//通常用于创建新的通信上下文，初始化 proxy 的内部状态
+  ncclProxyMsgSharedInit = 2,//共享初始化消息。可能用于多个进程共享某些资源时的初始化，比如共享内存或文件描述符。
+  ncclProxyMsgSetup = 3,//设置阶段的消息。用于配置通信参数，准备后续的数据传输。
+  ncclProxyMsgConnect = 4,//	连接请求消息。用于建立与其他节点或设备的连接。
+  ncclProxyMsgStart = 5,//启动通信的消息。在所有准备工作完成后，通过该消息触发实际的数据传输。
+  ncclProxyMsgClose = 6,//	关闭连接的消息。用于正常结束通信并释放相关资源。
+  ncclProxyMsgAbort = 7,//异常终止消息。当发生错误或需要紧急停止通信时发送此消息。
+  ncclProxyMsgStop = 8,// 停止通信的消息。与 ncclProxyMsgClose 不同，Stop 可能是更温和的停止方式。
+  ncclProxyMsgGetFd = 9, // cuMem API support (UDS)获取文件描述符的消息，用于 cuMem API 支持（如 Unix Domain Socket）。
+  ncclProxyMsgQueryFd = 10,//查询文件描述符的状态或相关信息。
+  ncclProxyMsgRegister = 11,//注册资源的消息。通常用于将某些资源（如内存缓冲区）注册到 NCCL 中。
+  ncclProxyMsgDeregister = 12//注销资源的消息。用于从 NCCL 中移除之前注册的资源，并释放相关资源。
 };
 
 // This function is called by a client of the proxy that needs to invoke any of the non-progress proxyOp types

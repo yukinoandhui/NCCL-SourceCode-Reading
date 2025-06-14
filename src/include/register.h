@@ -6,8 +6,8 @@
 #include <cuda.h>
 #include <stdint.h>
 
-int64_t ncclParamLocalRegister();
-int64_t ncclParamGraphRegister();
+int64_t ncclParamLocalRegister();//是否启用本地内存注册
+int64_t ncclParamGraphRegister();//是否启用 CUDA Graph 注册；
 
 enum {
   NET_REG_COMPLETE = 0x01,

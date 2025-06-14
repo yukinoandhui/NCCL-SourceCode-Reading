@@ -166,7 +166,7 @@ struct ncclSharedResources {
 struct ncclChannel {
   // peer是指的是 GPU 设备之间的点对点通信通道。
   struct ncclChannelPeer** peers;
-  struct ncclDevChannelPeer** devPeers;
+  struct ncclDevChannelPeer** devPeers;//是个数组，数组每个元素是个指针
   /* devPeer pointer array used for host side access */
   struct ncclDevChannelPeer** devPeersHostPtr;
   // 通信拓扑结构
@@ -444,7 +444,7 @@ struct ncclKernelPlanner {
 struct ncclComm {
   uint64_t startMagic;
   struct ncclMemoryStack memPermanent, memScoped; // 管理永久和作用域内存
-  // List of destructors to run when comm is destructed
+  // List of destructors to run when comm is destructed 就是一个回调链表，负责清理资源。
   struct ncclDestructor* destructorHead;
 
   struct ncclSharedResources* sharedRes;
@@ -462,13 +462,16 @@ struct ncclComm {
   ncclNetDeviceType netDeviceType;
   ncclCollNet_t* ncclCollNet;
   void* bootstrap;
-  // Bitmasks for ncclTransportP2pSetup
+  // Bitmasks for ncclTransportP2pSetup 
+  // 是个数组，大小为nrank。
+  // 其实就是标记当前rank对某个peer的连接是在哪些channel（利用掩码，例如0b100表示channel2上当前rank与peerrank连接了。）
+  // 例如connectSend[a]表示当前rank与rank a所连接的channel
   uint64_t* connectSend;
   uint64_t* connectRecv;
-  struct ncclTopoGraph graphs[NCCL_NUM_ALGORITHMS];
+  struct ncclTopoGraph graphs[NCCL_NUM_ALGORITHMS]; 
   bool initAlgoChannels[NCCL_NUM_ALGORITHMS];
   bool runtimeConn; // if dynamic connection is supported
-  bool directMode;
+  bool directMode;//同一个主机的同一个进程间的通信。
   int cuMemSupport;
 
   uint64_t magic; // Magic number for all network communication. Not a security key -- only goal is to detect mismatches.
@@ -494,7 +497,7 @@ struct ncclComm {
   int nNodes;
   int localRank;
   int localRanks;
-  int maxLocalRanks;
+  int maxLocalRanks; //所有node中最大的localRank数量
   int* rankToNode;//记录每个rank属于哪个节
   int* rankToLocalRank;
   int* localRankToRank;
