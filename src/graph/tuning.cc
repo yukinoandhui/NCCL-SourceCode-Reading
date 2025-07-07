@@ -11,7 +11,7 @@
 
 NCCL_PARAM(Nthreads, "NTHREADS", -2);
 NCCL_PARAM(Ll128Nthreads, "LL128_NTHREADS", -2);
-
+//把给定的线程数限制min和max之间，如果env小于0，则设置为默认值
 static int getNthreads(const char* name, int env, int min, int max, int def) {
   int nt = env;
   if (nt > 0) {
@@ -148,6 +148,7 @@ static float hwLat [3][NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS] =
 #define BLACKWELL_COMPCAP_IDX 3
 
 // LL128 max BW per channel
+// 这里的N是指Node，所以N1、N2是指node数量，以volta为例：单节点（N1）和双节点（N2）：最大带宽为 39.0 GB/s，四节点及以上（N4）：带宽下降到 20.4 GB/s
 static const double llMaxBws[][3] = {
   /* Volta-N1/Intel-N2/Intel-N4) */ {39.0, 39.0, 20.4},
   /* Ampere-N1/AMD-N2/AMD-N4) */ {87.7, 22.5 /*avg of ring & tree*/, 19.0},
@@ -192,29 +193,39 @@ static float getNetOverhead(struct ncclComm* comm) {
   if (comm->cpuArch == NCCL_TOPO_CPU_ARCH_X86 && comm->cpuVendor == NCCL_TOPO_CPU_VENDOR_AMD) return 2.0;
   return 1.0;
 }
+/*
+基于硬件拓扑、GPU 架构、网络带宽等信息，预测每种通信操作在不同算法和协议下的执行时间（延迟 + 带宽），从而选择最优的通信策略。
 
+*/
 ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCompCap, struct ncclTopoGraph** graphs) {
+  //设置 Ring + Simple 协议的最大线程数，通过环境变量或默认值获取。
   int simpleDefaultThreads = (graphs[NCCL_ALGO_RING]->bwIntra*graphs[NCCL_ALGO_RING]->nChannels <= PCI_BW) ? 256 : NCCL_SIMPLE_MAX_NTHREADS;
   comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE] =
     getNthreads("NCCL_NTHREADS", ncclParamNthreads(), 2*WARP_SIZE, NCCL_SIMPLE_MAX_NTHREADS, simpleDefaultThreads);
-  comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_SIMPLE] =
+  //设置 Tree + Simple 协议的最大线程数。
+    comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_SIMPLE] =
     getNthreads("NCCL_NTHREADS", ncclParamNthreads(), 2*WARP_SIZE, NCCL_SIMPLE_MAX_NTHREADS, NCCL_SIMPLE_MAX_NTHREADS);
-  comm->maxThreads[NCCL_ALGO_COLLNET_DIRECT][NCCL_PROTO_SIMPLE] =
+  //CollNetDirect、CollNetChain、NVLS、NVLSTree + Simple 协议使用最大线程数 NCCL_MAX_NTHREADS。
+    comm->maxThreads[NCCL_ALGO_COLLNET_DIRECT][NCCL_PROTO_SIMPLE] =
     comm->maxThreads[NCCL_ALGO_COLLNET_CHAIN][NCCL_PROTO_SIMPLE] =
     comm->maxThreads[NCCL_ALGO_NVLS][NCCL_PROTO_SIMPLE] =
     comm->maxThreads[NCCL_ALGO_NVLS_TREE][NCCL_PROTO_SIMPLE] = NCCL_MAX_NTHREADS;
+    //Ring 和 Tree 算法在 LL 协议下使用最大线程数
   comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_LL] =
     getNthreads("NCCL_NTHREADS", ncclParamNthreads(), 2*WARP_SIZE, NCCL_LL_MAX_NTHREADS, NCCL_LL_MAX_NTHREADS);
-  comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL128] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_LL128] =
+    // Ring 和 Tree 算法在 LL128 协议下使用最大线程数
+    comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL128] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_LL128] =
     getNthreads("NCCL_LL128_NTHREADS", ncclParamLl128Nthreads(), NCCL_LL128_MAX_NTHREADS/4, NCCL_LL128_MAX_NTHREADS, NCCL_LL128_MAX_NTHREADS);
 
   int nNodes = comm->nNodes;
   int nRanks = comm->nRanks;
-  if (nRanks <= 1) return ncclSuccess;
-
+  if (nRanks <= 1) return ncclSuccess;//单卡无需调优。
+  //根据最低 Compute Capability 决定使用的索引，用于查找对应架构下的带宽数据。
   int compCapIndex = minCompCap >= 100 ? BLACKWELL_COMPCAP_IDX : (minCompCap >= 90 ? HOPPER_COMPCAP_IDX : minCompCap >= 80 ? AMPERE_COMPCAP_IDX : VOLTA_COMPCAP_IDX);
-  int index2 = nNodes <= 2 ? nNodes-1 : 2;
+  int index2 = nNodes <= 2 ? nNodes-1 : 2;//节点数小于等于 2 时用 (nNodes - 1)，否则固定为 2。
   // LL: for single node, we look at GPU type; for multi-node, we look at CPU type
+  //单节点时使用 GPU 类型索引；多节点且 CPU 是 AMD 或混合类型时使用索引 1，否则索引 0。
+  //这是因为多节点时，数据传输主要受到网络的影响，而cpu类型可能会影响网络性能。因此根据cpu厂商来选取
   int index1 = nNodes == 1 ? compCapIndex :
                (comm->cpuVendor == NCCL_TOPO_CPU_VENDOR_AMD || comm->cpuVendor == NCCL_TOPO_CPU_VENDOR_MIXED) ? 1 : 0;
   double llMaxBw = llMaxBws[index1][index2];
@@ -223,64 +234,88 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   double perChMaxTreeLL128Bw = perChMaxTreeLL128Bws[compCapIndex][index2];
   // De-penalize Tree/Simple latency on Power systems to favor Tree than Ring
   if (comm->cpuArch == NCCL_TOPO_CPU_ARCH_POWER) hwLat[NCCL_HW_PCI][NCCL_ALGO_TREE][NCCL_PROTO_SIMPLE] = hwLat[NCCL_HW_PCI][NCCL_ALGO_RING][NCCL_PROTO_SIMPLE];
-  float ppn = (float)nRanks / nNodes;
+  float ppn = (float)nRanks / nNodes;//每个节点上的进程数（Process Per Node）。
 
+  // 初始化硬件类型数组,也就是节点内连接类型和节点间连接类型。
   int intraHw[NCCL_NUM_ALGORITHMS], hw[NCCL_NUM_ALGORITHMS];
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) intraHw[a] = graphs[a]->typeIntra == LINK_NVL ? NCCL_HW_NVLINK : NCCL_HW_PCI;
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) hw[a] = nNodes == 1 ? intraHw[a] : NCCL_HW_NET;
 
+  //遍历所有通信操作(AllReduce、AllGather 等)
   for (int coll=0; coll<NCCL_NUM_FUNCTIONS; coll++) {
+    //步骤数 AllReduce: 2×(nRanks - 1),ReduceScatter/AllGather: nRanks - 1，其他算法nRanks
     int nsteps = coll == ncclFuncAllReduce ? 2*(nRanks-1) :
       coll == ncclFuncReduceScatter || coll == ncclFuncAllGather ? nRanks-1 :
       nRanks;
 
     for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
+      //过滤掉不适用于当前通信类型的算法（如 Broadcast 只能用 Ring 算法）。
       if ((coll == ncclFuncBroadcast || coll == ncclFuncReduce) && a != NCCL_ALGO_RING) continue;
+      //这里的意思是，如果当前通信操作是 ReduceScatter 或 AllGather，并且算法不是 PAT、Ring、NVLS 或 CollNet Direct，则跳过。
+      //(按照这个意思是，这些算法不支持 ReduceScatter 或 AllGather 操作。但是我目前还是比较疑惑，需要后续看具体的实现来判断)
       if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
           && a != NCCL_ALGO_PAT && a != NCCL_ALGO_RING
           && a != NCCL_ALGO_NVLS && a != NCCL_ALGO_COLLNET_DIRECT) continue;
       if (coll == ncclFuncAllReduce && a == NCCL_ALGO_PAT) continue;
-
+      //遍历所有协议（LL、LL128、Simple 等）
       for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
+        //NVLS/NVLS_Tree 只支持 Simple 协议。
         if ((a == NCCL_ALGO_NVLS || a == NCCL_ALGO_NVLS_TREE) && p != NCCL_PROTO_SIMPLE) continue;
+        //PAT 算法只在 Simple 协议且启用时才可用。
         if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
             && a == NCCL_ALGO_PAT && (p != NCCL_PROTO_SIMPLE || ncclPatEnable(comm) == 0)) continue;
+        
         int collnet = (a == NCCL_ALGO_COLLNET_DIRECT || a == NCCL_ALGO_COLLNET_CHAIN) ? 1 : 0;
+        //判断是节点内还是节点间通信，并选择相应带宽。在现代数据中心中，两个节点之间可能通过NVLink Switch、PCIe 直接连接
         float bw = nNodes <= 2 || collnet ? graphs[a]->bwIntra : graphs[a]->bwInter;
         if (a == NCCL_ALGO_NVLS) bw = std::min(graphs[a]->bwIntra, graphs[a]->bwInter);
         if (a == NCCL_ALGO_NVLS_TREE) bw = std::min(graphs[a]->bwIntra, nNodes <= 2 ? graphs[a]->bwInter : graphs[a]->bwInter/2);
         float busBw = graphs[a]->nChannels * bw;
 
-        // Various model refinements
+        // Various model refinements 带宽调整（根据不同算法/协议优化）
+        //Ring + LL：限制bus最大带宽并打五折。
         if (a == NCCL_ALGO_RING && p == NCCL_PROTO_LL) { busBw = std::min(llMaxBw, busBw * .5); }
+        //Ring + LL128：乘以修正系数 0.92 并取最大值。
         if (a == NCCL_ALGO_RING && p == NCCL_PROTO_LL128) busBw = std::min(busBw * (0.92 /*120.0/128.0*/), graphs[a]->nChannels*perChMaxRingLL128Bw);
+        //Tree + AllReduce：乘以 0.92 并取最大值。
         if (a == NCCL_ALGO_TREE && coll == ncclFuncAllReduce) busBw = std::min(busBw*.92, graphs[a]->nChannels*perChMaxTreeBw);
+        //Tree + LL：除以 3.8 并取最大值。
         if (a == NCCL_ALGO_TREE && p == NCCL_PROTO_LL) busBw = std::min(busBw*1.0/3.8, llMaxBw);
+        //Tree + LL128：乘以特定比例因子（单节点 7/9，多节点 120/128）并取最大值。
         if (a == NCCL_ALGO_TREE && p == NCCL_PROTO_LL128) busBw = std::min(busBw * (nNodes == 1 ? 7.0/9.0 : 120.0/128.0), graphs[a]->nChannels*perChMaxTreeLL128Bw);
+        //Tree 模式下调低 15% 带宽。
         if (a == NCCL_ALGO_TREE && graphs[a]->pattern == NCCL_TOPO_PATTERN_TREE) busBw *= .85;
+        //PAT 算法带宽打七五折。
         if (a == NCCL_ALGO_PAT) busBw *= .75;
         if (a == NCCL_ALGO_COLLNET_DIRECT && p != NCCL_PROTO_SIMPLE) busBw = 0;  // Not used
         if (a == NCCL_ALGO_COLLNET_CHAIN && p != NCCL_PROTO_SIMPLE) busBw = 0;  // Not used
+        
+        //AllGather/ReduceScatter：按 GPU/NIC 比例缩放带宽。
         if (a == NCCL_ALGO_COLLNET_DIRECT && p == NCCL_PROTO_SIMPLE) {
           if (coll == ncclFuncAllGather || coll == ncclFuncReduceScatter) {
             busBw = ppn * bw;
-            // AllGather/ReduceScatter requires 1:1 GPU:NIC
-            int nicPerNode = comm->collNetHeadsNum;
+            // AllGather/ReduceScatter requires 1:1 GPU:NIC 
+            int nicPerNode = comm->collNetHeadsNum;//每个节点 NIC 数量。
+            //AllGather 多节点时检查 CollNet 是否支持。也就是要支持collnet，并且rank数小于nic数量
             if (coll == ncclFuncAllGather && comm->nNodes > 1) {
               if (!comm->ncclCollNet || !comm->ncclCollNet->iallgather || ppn > nicPerNode) busBw = 0;
             }
+            //ReduceScatter 多节点时检查 CollNet 是否支持。也就是要支持collnet，并且rank数小于nic数量
             if (coll == ncclFuncReduceScatter && comm->nNodes > 1) {
               if (!comm->ncclCollNet || !comm->ncclCollNet->ireducescatter || ppn > nicPerNode) busBw = 0;
             }
             // Measured corrective ratio needed at 1 ppn and 8ppn. Here we hackishly
-            // interpolate the two.
+            // interpolate the two. "在1 PPN和8 PPN的配置下测量得到修正比率，
+            // 并通过简单的线性插值估算中间PPN（如2-7 PPN）所需的修正比率。"​
+            // 插值调整带宽（1 ppn 到 8 ppn 之间插值）。
             float w = (ppn-1)/(8-1);
             busBw *= w*0.85 + (1-w)*0.95;
-          } else {
+          } else { //CollNetDirect：根据 GPU/NIC 比例调整带宽。
             // Collnet+Direct requires all GPUs to have a local NIC to work at full speed
+            //graphs[a]->nChannels：当前算法使用的通道数量（Channel Count），通常也代表可用的 NIC 数量（因为 CollNetDirect 要求每个 Channel 对应一个 NIC）。
             float factor = ppn / (1.0*graphs[a]->nChannels); // GPU/NIC ratio
-            factor -= (factor-1)/2;
-            busBw /= factor;
+            factor -= (factor-1)/2; //这一步是对 factor 做了一个经验性的“软化”处理，目的是当 GPU/NIC 比例较高时，降低惩罚力度，避免过度削减带宽估计值。
+            busBw /= factor; //根据上面计算出的 factor，将原始带宽除以这个值，模拟因 NIC 不足导致的带宽下降。
             if (minCompCap >= 90) busBw *= .85;
           }
         }
@@ -288,38 +323,47 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
         // Convert bus BW to algorithm BW
         if (!(a != NCCL_ALGO_RING && (coll == ncclFuncAllGather || coll == ncclFuncReduceScatter))) {
           float ratio = 1.0f;
-          if (a == NCCL_ALGO_RING) ratio *= (1.0 * nRanks) / nsteps;
+          if (a == NCCL_ALGO_RING) ratio *= (1.0 * nRanks) / nsteps;//这个计算推导一下就知道了，可以推导时间的比值，从而算得带宽比值
+          //NVLS 是全互联架构，但受硬件限制，带宽打八三折
           else if (a == NCCL_ALGO_NVLS || a == NCCL_ALGO_NVLS_TREE) ratio *= 5.0/6.0;
-          else ratio *= .5;
+          else ratio *= .5;//默认打五折，表示非 Ring 类型算法效率较低
           busBw *= ratio;
         }
         comm->bandwidths[coll][a][p] = busBw;
         comm->latencies[coll][a][p] = baseLat[a][p];
-        float intraLat = hwLat[intraHw[a]][a][p];
+        float intraLat = hwLat[intraHw[a]][a][p];//节点内通信延迟
         // With ppn=1 latencies are fully exposed, use the Tree network latency
+        // 当 ppn == 1（每个节点只有一个 GPU）时，跨节点延迟统一使用 Tree 算法的延迟。
         float interLat = ppn == 1 ? hwLat[NCCL_HW_NET][NCCL_ALGO_TREE][p] : hwLat[NCCL_HW_NET][a][p];
         interLat += graphs[a]->latencyInter;
-        // Also add the flush extra latency
+        // Also add the flush extra latency 对 Simple 协议，额外加一次 latencyInter，模拟 flush 数据的开销。
         if (p == NCCL_PROTO_SIMPLE) interLat += graphs[a]->latencyInter;
 
+        //根据不同算法细化延迟计算
         if (a == NCCL_ALGO_RING) {
           float lat = hwLat[hw[a]][a][p];
           if ((coll == ncclFuncReduce || coll == ncclFuncBroadcast)) {
-            if (graphs[a]->sameChannels) {
+            if (graphs[a]->sameChannels) {//如果通道相同（sameChannels），直接加上基础延迟。这里可能的解释是，通道相同意味着路径固定、可复用。减少了开销。
               comm->latencies[coll][a][p] += lat;
-            } else {
+            } else {//否则按 nsteps * lat 计算（Simple 协议用 Tree 的延迟替代）。
               if (p == NCCL_PROTO_SIMPLE) lat = hwLat[hw[a]][NCCL_ALGO_TREE][p]; // Add some chunk latency, waiting for proper chunk modeling
               comm->latencies[coll][a][p] += nsteps*lat;
             }
           } else {
             // Inter-node rings still have to launch nsteps * net overhead.
+            /*
+            netOverhead：网络通信的额外开销（比如启动通信、上下文切换、序列化等）
+            在 Simple 协议中，由于缺乏像 LL/LL128 那样的高效 chunking 机制，这些开销会被放大。
+            所以 NCCL 给 Simple 协议的 netOverhead 乘以 3，模拟其更高的启动成本。
+            */
             float netOverhead = 0.0;
             if (nNodes > 1) {
-              netOverhead = getNetOverhead(comm);
+              netOverhead = getNetOverhead(comm);//每个通信步骤中，涉及 NIC、DMA、CPU 调度等的最小启动延迟。
               if (p == NCCL_PROTO_SIMPLE) netOverhead *= 3;
             }
             intraLat = std::max(intraLat, netOverhead);
             int nInterSteps = nNodes == 1 ? 0 : coll == ncclFuncAllReduce ? 2*(nNodes-1) : nNodes-1;
+            //节点内和节点间。
             comm->latencies[coll][a][p] += (nsteps-nInterSteps)*intraLat + nInterSteps*interLat;
           }
         } else if (a == NCCL_ALGO_TREE) {
@@ -364,6 +408,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   const char *protoStr = ncclGetEnv("NCCL_PROTO");
   if (protoStr) {
     INFO(NCCL_ENV, "NCCL_PROTO set by environment to %s", protoStr);
+    //parseList 函数解析字符串格式，决定哪些协议（如 LL, Simple, LL128）在哪些操作（如 allreduce, broadcast）上被启用或禁用。
     NCCLCHECK(parseList(protoStr, ncclFuncStr, NCCL_NUM_FUNCTIONS, ncclProtoStr, NCCL_NUM_PROTOCOLS, protoEnable));
   }
   const char *algoStr = ncclGetEnv("NCCL_ALGO");
@@ -372,6 +417,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
     NCCLCHECK(parseList(algoStr, ncclFuncStr, NCCL_NUM_FUNCTIONS, ncclAlgoStr, NCCL_NUM_ALGORITHMS, algoEnable));
   }
 
+  //如果当前进程是 rank 0 并且设置了 NCCL_PROTO 或 NCCL_ALGO，则构建一个字符串，展示每个函数（Function）、协议（Protocol）、算法（Algorithm）的启用状态。
   if (comm->rank == 0 && (algoStr||protoStr)) {
     constexpr int strLength = 1024;
     char funcAlgoProtoTuningStr[strLength];
@@ -403,11 +449,11 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
 
   int nvsCount = 0;
   NCCLCHECK(ncclTopoGetNvsCount(comm->topo, &nvsCount));
-
+//基于硬件条件自动禁用某些算法
   for (int f=0; f<NCCL_NUM_FUNCTIONS; f++) {
     for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
       int disable = 0;
-      // Disable NVLS Tree on a single node
+      // Disable NVLS Tree on a single node 例如，在单节点系统中禁用 NVLS Tree，因为该算法适用于多节点拓扑。
       if (comm->nNodes == 1 && a == NCCL_ALGO_NVLS_TREE) disable = 1;
       // Disable Collnet+Direct, Collnet+Chain or Collnet+NVLS if collnet is not supported.
       if (comm->collNetSupport == 0 &&
@@ -419,7 +465,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
       if (disable) algoEnable[f*NCCL_NUM_ALGORITHMS+a] = 0;
     }
   }
-
+  //如果启用了 LL128 协议，则进一步检查是否满足特定的硬件要求（如是否使用 Volta/Ampere 架构、是否通过 NVLink 连接等）。
   for (int c=0; c<NCCL_NUM_FUNCTIONS; c++) for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
     int pEnable = protoEnable[c*NCCL_NUM_PROTOCOLS+p];
     if (pEnable == 2 && p == NCCL_PROTO_LL128) {
@@ -440,7 +486,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
     if (pEnable == 0) comm->bandwidths[c][a][p] = 0;
     if (algoEnable[c*NCCL_NUM_ALGORITHMS+a] == 0) comm->bandwidths[c][a][p] = 0;
   }
-
+  //打印算法/协议性能信息
   if (comm->rank == 0) {
     constexpr int lineLen = 1024;
     char line[lineLen];
@@ -484,6 +530,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   }
  
   // Set per-thread amount of work before we increase nThreads and nChannels
+  //线程阈值配置,设置不同算法和协议下的线程阈值
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
     comm->threadThresholds[a][NCCL_PROTO_LL] = NCCL_LL_THREAD_THRESHOLD;
     comm->threadThresholds[a][NCCL_PROTO_LL128] = NCCL_LL128_THREAD_THRESHOLD;
@@ -493,7 +540,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   comm->threadThresholds[NCCL_ALGO_COLLNET_DIRECT][NCCL_PROTO_SIMPLE] = 512;
   comm->threadThresholds[NCCL_ALGO_COLLNET_CHAIN][NCCL_PROTO_SIMPLE] = 512;
 
-  // Override defaults with user env
+  // Override defaults with user env 用户自定义覆盖
   const char* str = ncclGetEnv("NCCL_THREAD_THRESHOLDS");
   if (str) {
     INFO(NCCL_ENV, "NCCL_THREAD_THRESHOLDS set by environment to %s", str);

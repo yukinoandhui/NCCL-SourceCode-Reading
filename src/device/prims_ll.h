@@ -131,8 +131,17 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
     uint64_t val64 = line[i].data1 + (((uint64_t)line[i].data2) << 32);
     return val64;
   }
+  //将val和flag写入dst（向量的形式）
+  /*
+  "r"	使用通用寄存器（register）来传递 32 位整数
+"l"	long 类型，通常用于指针（地址）
+"f"	浮点数
+"r64"	64 位寄存器（适用于 long long 或 uint64_t）
+"=r"	输出操作数，使用寄存器接收结果
 
+  */
   __device__ void storeLL(union ncclLLFifoLine* dst, uint64_t val, uint32_t flag) {
+    //最终写入的内容是一个包含两个 32 位整数的结构体（共 64 位），外加两个相同的 flag（可能是用来标记状态或控制位）。
     asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(&dst->i4), "r"((uint32_t)val), "r"(flag), "r"((uint32_t)(val >> 32)), "r"(flag) : "memory");
   }
 

@@ -630,7 +630,7 @@ int ncclPxnDisable(struct ncclComm* comm) {
   }
   return pxnDisable;
 }
-
+//获取所有可以通过中转到达的rank的中转rank
 ncclResult_t ncclTopoGetPxnRanks(struct ncclComm* comm, int** intermediateRanks, int* nranks) {
   struct ncclTopoSystem* system = comm->topo;
   *nranks = 0;
@@ -931,7 +931,7 @@ ncclResult_t ncclTopoComputeP2pChannels(struct ncclComm* comm) {
 
   return ncclSuccess;
 }
-
+//找到所有与当前gpu连接的路径是nvb的gpu，记录他们的rank到ranks数组中，并记录数量nranks。
 ncclResult_t ncclTopoGetNvbGpus(struct ncclTopoSystem* system, int rank, int* nranks, int** ranks) {
   int ngpus = system->nodes[GPU].count;
   NCCLCHECK(ncclCalloc(ranks, ngpus));

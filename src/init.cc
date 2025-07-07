@@ -1247,6 +1247,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     NCCLCHECKGOTO(ncclTransportTreeConnect(comm), ret, fail);
 
     // Connect PAT only for communicators with 1 GPU per node
+    //只有当每个节点只有一个GPU时，才需要连接PAT。
     if (comm->maxLocalRanks == 1) NCCLCHECKGOTO(ncclTransportPatConnect(comm), ret, fail);
 
     // Setup NVLS
@@ -1265,34 +1266,45 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       }
     }
 
-    // Connect to local net proxy
+    // Connect to local net proxy 这里是连接到本地的 net proxy
+    //即使在同一节点上，NCCL 也需要连接本地的 net proxy，是为了统一通信接口、分离职责、支持异步操作，并为后续跨节点通信做好准备。
+    //这里我的理解是一个节点上的多个rank，也要连接到同一个net proxy上。
     NCCLCHECKGOTO(ncclProxyConnect(comm, TRANSPORT_NET, 1, comm->rank, &proxyConn), ret, fail);
+    //发送信息，并等待回复
     NCCLCHECKGOTO(ncclProxyCallBlocking(comm, &proxyConn, ncclProxyMsgSharedInit, &comm->p2pnChannels, sizeof(int), NULL, 0), ret, fail);
 
     // Then to remote ones when using PXN
-    if (ncclPxnDisable(comm) == 0) {
+    if (ncclPxnDisable(comm) == 0) {//检查是否禁用了 PXN 模
       int nranks;
+      //取当前 rank 在 PXN 拓扑中需要连接的所有 peer ranks(中间rank)。
       NCCLCHECKGOTO(ncclTopoGetPxnRanks(comm, &pxnPeers, &nranks), ret, fail);
       for (int r=0; r<nranks; r++) {
+        //建立到该rank 的 proxy 连接
         NCCLCHECKGOTO(ncclProxyConnect(comm, TRANSPORT_NET, 1, pxnPeers[r], &proxyConn), ret, fail);
         NCCLCHECKGOTO(ncclProxyCallBlocking(comm, &proxyConn, ncclProxyMsgSharedInit, &comm->p2pnChannels, sizeof(int), NULL, 0), ret, fail);
       }
     }
-
+    //NVB 模式下的 P2P 通道预连接
     if (ncclParamNvbPreconnect()) {
       // Connect p2p when using NVB path
       int nvbNpeers;
+      //获取所有nvb的peer
       NCCLCHECKGOTO(ncclTopoGetNvbGpus(comm->topo, comm->rank, &nvbNpeers, &nvbPeers), ret, fail);
       for (int r=0; r<nvbNpeers; r++) {
         int peer = nvbPeers[r];
         int sendRound=0, recvRound=0;
+        //找到对应的round
         while (comm->p2pSchedule[sendRound].sendRank != peer) sendRound++;
         while (comm->p2pSchedule[recvRound].recvRank != peer) recvRound++;
+        //sendBase 和 recvBase 表示这些 channel ，这里就是确定channel id
         uint8_t sendBase = ncclP2pChannelBaseForRound(comm, sendRound);
         uint8_t recvBase = ncclP2pChannelBaseForRound(comm, recvRound);
         for (int c=0; c<comm->p2pnChannelsPerPeer; c++) {
+          //每个peer最多p2pnChannelsPerPeer个通道
           int channelId;
+          //计算当前sendRound、c等情况下的最终的channel id，我猜是为了负载均衡？
           channelId = ncclP2pChannelForPart(comm->p2pnChannels, sendBase, c);
+          //如果当前peer的send通道还没有连接，则将该通道标记为需要连接，也就是connectSend做mask处理
           if (comm->channels[channelId].peers[peer]->send[1].connected == 0) {
             comm->connectSend[peer] |= (1UL<<channelId);
           }
@@ -1302,7 +1314,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
           }
         }
       }
-
+      //标记好mask后开始连接
       NCCLCHECKGOTO(ncclTransportP2pSetup(comm, NULL, 1), ret, fail);
     }
   }
@@ -1318,12 +1330,14 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     const char* str = ncclGetEnv("NCCL_LAUNCH_MODE");
     enum ncclLaunchMode mode, modeOld;
     if (str && strcasecmp(str, "GROUP") == 0) {
-      mode = ncclLaunchModeGroup;
+      mode = ncclLaunchModeGroup;//将多个通信操作分组后统一启动
     } else {
-      mode = ncclLaunchModeParallel;
+      mode = ncclLaunchModeParallel;//所有通信操作并行启动
     }
     // In theory we could be racing with other communicators not associated with
     // this one if the user is connecting to multiple ncclUniqueId's concurrently.
+    // 这里的意思是如果使用了多个 ncclUniqueId，可能会与其他通信器发生竞争。
+    // 使用原子操作 __atomic_exchange_n 设置全局的启动模式，避免多线程并发冲突。
     modeOld = __atomic_exchange_n(&ncclParamLaunchMode, mode, __ATOMIC_RELAXED);
     if (modeOld == ncclLaunchModeInvalid && str && str[0]!='\0') {
       INFO(NCCL_ENV, "NCCL_LAUNCH_MODE set by environment to %s", mode == ncclLaunchModeParallel ? "PARALLEL" : "GROUP");
@@ -1332,9 +1346,10 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   // Call devCommSetup before the last barrier, making sure we don't have a thread running in front and starting to
   // launch NCCL kernels before all cuda mem allocation is complete. That could cause a deadlock.
+  // 调用 devCommSetup() 函数完成 GPU 设备上的通信资源初始化（如内存分配、FIFO 缓冲区等）。
   NCCLCHECKGOTO(devCommSetup(comm), ret, fail);
   timers[TIMER_INIT_CONNECT] = clockNano() -  timers[TIMER_INIT_CONNECT];
-  /* Local intra-node barrier */
+  /* Local intra-node barrier  节点内同步屏障*/
   NCCLCHECKGOTO(bootstrapIntraNodeBarrier(comm->bootstrap, comm->localRankToRank, comm->localRank, comm->localRanks, comm->localRankToRank[0]), ret, fail);
 
   // We should have allocated all buffers, collective fifos, ... we can

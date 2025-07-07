@@ -1185,7 +1185,7 @@ static ncclResult_t bootstrapP2PBarrier(void* commState, int* ranks, int rank, i
   }
   return ncclSuccess;
 }
-
+//节点内的barrier，确保同一节点内的所有进程都完成了前面的初始化步骤（如内存分配、参数设置等）之后再继续执行后续逻辑。
 ncclResult_t bootstrapIntraNodeBarrier(void* commState, int* ranks, int rank, int nranks, int tag) {
   uint64_t time = 0;
   BOOTSTRAP_PROF_OPEN(time);

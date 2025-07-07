@@ -123,21 +123,21 @@ struct ncclConnInfo {
 };
 
 struct ncclProxyConnector {
-  bool initialized;
+  bool initialized;//是否已初始化。
   int rank;
   int tpRank;
   int tpLocalRank;
-  int sameProcess;
+  int sameProcess;//是否在同一个进程中。
   struct ncclProxyConnection* connection;
   ncclResult_t (*proxyProgress)(struct ncclProxyState* proxyState, struct ncclProxyArgs*); // Copied from transport if necessary
 };
 
 struct ncclConnector {
   int connected;//是否完成连接的建立
-  struct ncclProxyConnector proxyConn;
-  struct ncclTransportComm* transportComm;
-  void* transportResources;//transportResources为通信过程中用到的buffer
-  struct ncclConnInfo conn;
+  struct ncclProxyConnector proxyConn;//代理连接信息
+  struct ncclTransportComm* transportComm;//传输通信指针。
+  void* transportResources;//transportResources为通信过程中用到的buffer,传输过程中用到的资源。
+  struct ncclConnInfo conn;//连接信息。
 };
 
 struct ncclRing {
@@ -240,11 +240,13 @@ inline __host__ uint8_t ncclP2pChannelBaseForRound(struct ncclComm* comm, int p2
 
 // ncclP2pChannelToPart and ncclP2pChannelForPart are inverses. The device code
 // uses ncclP2pChannelToPart to determine which part "this" channel is responsible for.
+//根据给定的 channel 基索引 (base)、部分编号 (part) 和总的 P2P channel 数量 (nP2pChannels)，计算出对应的 channel 编号。
 inline __host__ int ncclP2pChannelForPart(int nP2pChannels, int base, int part) {
   // Only works because nP2pChannels is pow2
-  int nChannelsLog2 = countOneBits(nP2pChannels-1);
-  int delta = reverseBits(part, nChannelsLog2);
-  return (base + delta) & (nP2pChannels-1);
+  int nChannelsLog2 = countOneBits(nP2pChannels-1);//算 nP2pChannels 所需的二进制位数
+  int delta = reverseBits(part, nChannelsLog2);//将 part 的二进制位进行反转,如果 nChannelsLog2 是 3，那么 part=5（二进制为 101）会被反转成 101 -> 101（如果不足三位则补零）。
+  return (base + delta) & (nP2pChannels-1);//将基索引加上反转后的偏移量，得到最终的 channel 编号。
+
 }
 inline __device__ int ncclP2pChannelToPart(int nP2pChannels, int base, int channel) {
   // Only works because nP2pChannels is pow2
@@ -339,7 +341,7 @@ constexpr size_t ncclDevWorkSize(enum ncclDevWorkType type) {
 
 #define NCCL_MAX_DEV_WORK_BATCH_BYTES 1024
 #define NCCL_MAX_DEV_WORK_BATCH_COLLS (NCCL_MAX_DEV_WORK_BATCH_BYTES/sizeof(ncclDevWorkColl))
-#define NCCL_MAX_DEV_WORK_P2P_PER_BATCH 8
+#define NCCL_MAX_DEV_WORK_P2P_PER_BATCH //定义了每个 batch 可以处理的最大设备工作数量，用于控制每个 channel 承载的任务数量。
 //每个channel需要的工作批次结构体。
 struct alignas(16) ncclDevWorkBatch {
   union {

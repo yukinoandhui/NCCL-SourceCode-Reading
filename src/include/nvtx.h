@@ -76,9 +76,9 @@ class payload_schema {
 #define NVTX3_PAYLOAD(...) __VA_ARGS__
 
 // Create NVTX push/pop range with parameters
-// @param N NCCL API name without the `nccl` prefix.
-// @param T name of the used NVTX payload schema without "Schema" suffix.
-// @param P payload parameters/entries
+// @param N NCCL API name without the `nccl` prefix. 函数名
+// @param T name of the used NVTX payload schema without "Schema" suffix. payload schema 的类型名（不带 Schema 后缀）
+// @param P payload parameters/entries payload 的具体参数值
 #define NVTX3_FUNC_WITH_PARAMS(N, T, P) \
   constexpr uint64_t schemaId = NVTX_PAYLOAD_ENTRY_TYPE_SCHEMA_ID_STATIC_START + NVTX_SID_##N; \
   static const payload_schema schema{T##Schema, std::extent<decltype(T##Schema)>::value - 1, \

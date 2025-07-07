@@ -25,7 +25,10 @@ ncclResult_t ncclTransportRingConnect(struct ncclComm* comm) {
       NCCLCHECK(ncclCalloc(&ringInfo, comm->nRanks));
       ringInfo[comm->rank].useGdr = comm->useGdr;
       ringInfo[comm->rank].useNetPXN = comm->useNetPXN;
+      //所有 rank 的 ringInfo 这是一个阻塞式同步操作，确保所有 rank 都完成初始化；
       NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, ringInfo, sizeof(struct ringConnInfo)), ret, fail);
+      //如果任何一个 rank 不支持 GDR，则整个通信器禁用 
+      //如果有任意 rank 使用 PXN，则启用 PXN；
       for (int i = 0; i < comm->nRanks; ++i) {
         if (!ringInfo[i].useGdr) comm->useGdr = false;
         if (ringInfo[i].useNetPXN) comm->useNetPXN = true;
@@ -58,10 +61,13 @@ exit:
 fail:
   goto exit;
 }
-
+/*
+基于 Brucks 的 Parallel Aggregated Trees (PAT) 算法，实现了对数缩放。
+*/
 ncclResult_t ncclTransportPatConnect(struct ncclComm* comm) {
   ncclResult_t ret = ncclSuccess;
   if (comm && comm->nRanks > 1) {
+    //通过 mask 的位移操作逐步构造不同层级的树形连接。mask 表示当前层级的跨度。
     for (int mask=1; mask<comm->nRanks; mask<<=1) {
       int prevPeer = (comm->rank + mask) % comm->nRanks;
       int nextPeer = (comm->rank + comm->nRanks - mask) % comm->nRanks;

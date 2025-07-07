@@ -1065,7 +1065,7 @@ struct ncclProxyInitResp {
   ncclProxyConnection* connection;
   char devShmPath[6]; // "XXXXXX" - May or may not be set
 };
-
+//用于建立两个进程之间的代理连接，也就是连接到proxyRank
 ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, int proxyRank, struct ncclProxyConnector* proxyConn) {
   struct ncclSocket* sock;
   int ready;
@@ -1078,6 +1078,7 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
   proxyConn->connection = NULL;
   proxyConn->tpRank = tpProxyRank;
   proxyConn->rank = proxyRank;
+  //如果 peerSocks 尚未分配，则为其分配内存，并初始化每个套接字的文件描述符。
   if (sharedProxyState->peerSocks == NULL) {
     NCCLCHECK(ncclCalloc(&sharedProxyState->peerSocks, comm->sharedRes->tpNLocalRanks));
     NCCLCHECK(ncclCalloc(&sharedProxyState->proxyOps, comm->sharedRes->tpNLocalRanks));
@@ -1089,22 +1090,24 @@ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, in
 
   proxyConn->tpLocalRank = comm->sharedRes->tpRankToLocalRank[proxyConn->tpRank];
   sock = sharedProxyState->peerSocks + proxyConn->tpLocalRank;
+  //初始化socket
   NCCLCHECK(ncclSocketReady(sock, &ready));
   if (!ready) {
     NCCLCHECK(ncclSocketInit(sock, sharedProxyState->peerAddresses+proxyConn->tpRank, comm->sharedRes->magic, ncclSocketTypeProxy, comm->abortFlag));
-    NCCLCHECK(ncclSocketConnect(sock));
+    NCCLCHECK(ncclSocketConnect(sock));//
   }
 
-  struct ncclProxyInitReq req = {0};
+  struct ncclProxyInitReq req = {0};//请求
   req.transport = transport;
   req.send = send;
   req.tpLocalRank = comm->topParentLocalRanks[comm->localRank];
   req.tpRank = comm->topParentRanks[comm->rank];
   req.sameProcess = proxyConn->sameProcess;
 
-  struct ncclProxyInitResp resp = {0};
+  struct ncclProxyInitResp resp = {0};//响应
   // This usually sends proxyConn->connection to identify which connection this is.
   // However, this is part of the response and therefore is ignored
+  //发送请求并等待响应。
   NCCLCHECK(ncclProxyCallBlocking(comm, proxyConn, ncclProxyMsgInit, &req, sizeof(req), &resp, sizeof(resp)));
   proxyConn->connection = resp.connection;
 
@@ -1291,7 +1294,7 @@ ncclResult_t ncclPollProxyResponse(struct ncclComm* comm, struct ncclProxyConnec
 
   return res;
 }
-
+//发送数据，并等到回复
 ncclResult_t ncclProxyCallBlocking(struct ncclComm* comm, struct ncclProxyConnector* proxyConn, int type, void* reqBuff, int reqSize, void* respBuff, int respSize) {
   // Alloc some memory to act as a handle
   ncclResult_t res = ncclSuccess;

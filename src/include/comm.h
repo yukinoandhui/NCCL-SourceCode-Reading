@@ -539,7 +539,7 @@ struct ncclComm {
   float latencies[NCCL_NUM_FUNCTIONS][NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
   float bandwidths[NCCL_NUM_FUNCTIONS][NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
   int maxThreads[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
-
+ 
   /* This attribute can indicate the states of communicators and return code of
    * asynchronous NCCL operations. */
   ncclResult_t asyncResult;
@@ -587,7 +587,7 @@ struct ncclComm {
   uint8_t collNetSupportMatrix[4/*sum,prod,max,min*/][ncclNumTypes];
   bool intraNodeP2pSupport;
   int* collNetHeads;
-  int collNetHeadsNum;
+  int collNetHeadsNum;//好像是nic per node? 我猜的
   int* collNetDenseToUserRank;
   int* collNetUserToDenseRank;
   /* sharable collNet proxy progress resource. */

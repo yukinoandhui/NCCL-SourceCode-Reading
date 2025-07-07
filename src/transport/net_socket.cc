@@ -26,7 +26,7 @@ struct ncclNetSocketDev {
 static struct ncclNetSocketDev ncclNetSocketDevs[MAX_IFS];
 
 pthread_mutex_t ncclNetSocketLock = PTHREAD_MUTEX_INITIALIZER;
-
+// 获取设备的pci路径
 static ncclResult_t ncclNetSocketGetPciPath(char* devName, char** pciPath) {
   char devicePath[PATH_MAX];
   snprintf(devicePath, PATH_MAX, "/sys/class/net/%s/device", devName);
@@ -229,32 +229,33 @@ void* persistentSocketThread(void *args_) {
   while (1) {
     int idle = 1;
     int mark = myQueue->next; // mark newest task seen
-    for (int i=0; i<myQueue->len; i+=nSocksPerThread) {
+    for (int i=0; i<myQueue->len; i+=nSocksPerThread) {//这里的理解是处理的任务数量，不是socket数量。
       int repeat;
       do {
         repeat = 0;
         for (int j=0; j<nSocksPerThread; j++) {
           struct ncclNetSocketTask* r = myQueue->tasks+i+j;
           if (r != NULL && r->used == 1 && r->offset < r->size) {
-            r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);
+            r->result = ncclSocketProgress(r->op, r->sock, r->data, r->size, &r->offset);//非阻塞
             if (r->result != ncclSuccess) {
               WARN("NET/Socket : socket progress error");
               return NULL;
             }
             idle = 0;
+            //如果某个任务尚未完成（offset < size），则设置 repeat=1，继续重试这一批任务。
             if (r->offset < r->size) repeat = 1;
           }
         }
       } while (repeat);
     }
-    if (idle) {
+    if (idle) {//当前没有任务要处理时（idle == 1），线程进入等待状态。
       pthread_mutex_lock(&resource->threadLock);
       while (mark == myQueue->next && resource->stop == 0) { // no new tasks, wait
         pthread_cond_wait(&resource->threadCond, &resource->threadLock);
       }
       pthread_mutex_unlock(&resource->threadLock);
     }
-    if (resource->stop) return NULL;
+    if (resource->stop) return NULL;//没有外部信号是不会终止的，这通常用于后台服务线程。
   }
 }
 
@@ -275,7 +276,7 @@ ncclResult_t ncclNetSocketGetNsockNthread(int dev, int* ns, int* nt) {
     snprintf(vendorPath, PATH_MAX, "/sys/class/net/%s/device/vendor", ncclNetSocketDevs[dev].devName);
     // Coverity is wrong.  NULL second argument to realpath() is OK by POSIX.1-2008.
     // coverity[alias_transfer:FALSE]
-    char* rPath = realpath(vendorPath, NULL);
+    char* rPath = realpath(vendorPath, NULL);//打开对应的网络设备的vendor信息
     fd = open(rPath, O_RDONLY);
     free(rPath);
     if (fd == -1) {
@@ -290,7 +291,7 @@ ncclResult_t ncclNetSocketGetNsockNthread(int dev, int* ns, int* nt) {
     if (strcmp(vendor, "0x1d0f") == 0) { // AWS
       autoNt = 2;
       autoNs = 8;
-    } else if (strcmp(vendor, "0x1ae0") == 0) { // GCP
+    } else if (strcmp(vendor, "0x1ae0") == 0) { // GCP （Google的云平台）
       autoNt = 4;
       autoNs = 1;
     }
@@ -313,7 +314,7 @@ exit:
 fail:
   goto exit;
 }
-
+//根据指定的网络设备dev号创建并初始化一个监听通信对象。这里listen的是本地的网络接口
 ncclResult_t ncclNetSocketListen(int dev, void* opaqueHandle, void** listenComm) {
   if (dev < 0 || dev >= ncclNetIfs) { // data transfer socket is based on specified dev
     WARN("NET/Socket : ncclNetSocketListen dev=%d ncclNetIfs=%d", dev, ncclNetIfs);

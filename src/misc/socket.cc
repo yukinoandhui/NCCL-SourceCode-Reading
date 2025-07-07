@@ -98,10 +98,10 @@ const char *ncclSocketToString(const union ncclSocketAddress *addr, char *buf, c
   sprintf(buf, "%s<%s>", host, service);
   return buf;
 }
-
+//获取主机字节序的端口号
 static uint16_t socketToPort(union ncclSocketAddress *addr) {
   struct sockaddr *saddr = &addr->sa;
-  return ntohs(saddr->sa_family == AF_INET ? addr->sin.sin_port : addr->sin6.sin6_port);
+  return ntohs(saddr->sa_family == AF_INET ? addr->sin.sin_port : addr->sin6.sin6_port);//将 16 位（2字节）数据从网络字节序（大端序）转换为主机字节序​​
 }
 
 /* Allow the user to force the IPv4/IPv6 interface selection */
@@ -342,13 +342,13 @@ ncclResult_t ncclSocketGetAddrFromString(union ncclSocketAddress* ua, const char
   }
   return ncclSuccess;
 }
-
+//该函数用于查找并返回可用的网络接口,优先顺序为：用户指定接口 > InfiniBand（ib）> 与NCCL_COMM_ID同一子网的接口 > 非docker/lo的其他接口 > docker > lo。
 int ncclFindInterfaces(char* ifNames, union ncclSocketAddress *ifAddrs, int ifNameMaxSize, int maxIfs) {
   static int shownIfName = 0;
   int nIfs = 0;
-  // Allow user to force the INET socket family selection
+  // Allow user to force the INET socket family selection 从环境变量中获取socket的地址族，目前是选择ipv4或ipv6。
   int sock_family = envSocketFamily();
-  // User specified interface
+  // User specified interface 指定的网络接口
   const char* env = ncclGetEnv("NCCL_SOCKET_IFNAME");
   if (env && strlen(env) > 1) {
     INFO(NCCL_ENV, "NCCL_SOCKET_IFNAME set by environment to %s", env);
@@ -389,9 +389,10 @@ ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
     return ncclInvalidArgument;
   }
 
-  if (socketToPort(&sock->addr)) {
+  if (socketToPort(&sock->addr)) {//如果端口号不为0
     // Port is forced by env. Make sure we get the port.
     int opt = 1;
+    //setsockopt 是 ​​套接字编程​​ 中用于设置套接字选项（Socket Options）的核心函数，允许开发者精细控制套接字的行为（如超时、缓冲区大小、重用地址等）
     SYSCHECK(setsockopt(sock->fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)), "setsockopt");
 #if defined(SO_REUSEPORT)
     SYSCHECK(setsockopt(sock->fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)), "setsockopt");

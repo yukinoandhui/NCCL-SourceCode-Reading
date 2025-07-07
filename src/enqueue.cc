@@ -2202,7 +2202,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
   return ncclSuccess;
 }
 
-ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
+ncclResult_t  ncclEnqueueCheck(struct ncclInfo* info) {
   NCCLCHECK(ncclGroupStartInternal());
   ncclResult_t ret = ncclSuccess;
   int devOld = -1;
