@@ -24,7 +24,7 @@ static void msleep(unsigned int time_msec) {
   };
   nanosleep(&tv, NULL);
 }
-//尝试发送/接收数据，但每次只处理部分数据
+//尝试发送/接收数据。出错时或者在recv模式没有收到数据，会填充closed为1，表明远端关闭了连接
 static ncclResult_t socketProgressOpt(int op, struct ncclSocket* sock, void* ptr, int size, int* offset, int block, int* closed) {
   int bytes = 0;
   *closed = 0;
@@ -58,7 +58,7 @@ static ncclResult_t socketProgressOpt(int op, struct ncclSocket* sock, void* ptr
   } while (sock->asyncFlag == 0 && bytes > 0 && (*offset) < size);//如果不指定异步，那这里会一直阻塞（同步模式）。
   return ncclSuccess;
 }
-
+//根据指定op执行相应动作（从offset开始发送、接收），如果peer端关闭连接，则pclosed=1；
 static ncclResult_t socketProgress(int op, struct ncclSocket* sock, void* ptr, int size, int* offset, int* pclosed = NULL) {
   int closed;
   NCCLCHECK(socketProgressOpt(op, sock, ptr, size, offset, 0 /*block*/, &closed));//固定使用非阻塞模式（block=0）
@@ -74,7 +74,7 @@ static ncclResult_t socketProgress(int op, struct ncclSocket* sock, void* ptr, i
   }
   return ncclSuccess;
 }
-
+//发送size大小的数据
 static ncclResult_t socketWait(int op, struct ncclSocket* sock, void* ptr, int size, int* offset) {
   while (*offset < size)
     NCCLCHECK(socketProgress(op, sock, ptr, size, offset));
@@ -378,7 +378,7 @@ int ncclFindInterfaces(char* ifNames, union ncclSocketAddress *ifAddrs, int ifNa
   }
   return nIfs;
 }
-
+//根据sock的地址和fd进行监听（bind+listen），这个过程中进行了细粒度的套接字设置（可重用等）
 ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
   if (sock == NULL) {
     WARN("ncclSocketListen: pass NULL socket");
@@ -393,17 +393,23 @@ ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
     // Port is forced by env. Make sure we get the port.
     int opt = 1;
     //setsockopt 是 ​​套接字编程​​ 中用于设置套接字选项（Socket Options）的核心函数，允许开发者精细控制套接字的行为（如超时、缓冲区大小、重用地址等）
+    // SOL_SOCKET是通用套接字选项（与协议无关）、还可以选择tcp、IP层。 SO_REUSEADDR选项表示允许重用本地地址和端口。
+    //SO_REUSEADDR 允许你的程序​​立即重用​​之前被占用（比如程序崩溃后还没释放）的 ​​IP地址 + 端口​​，避免出现“地址已在使用”的错误。
+    //同一个 IP + 端口 组合只能被 ​​一个 TCP 套接字​​ 绑定。
+    //一般服务器的监听socket都应该打开它。需要在bind之前设定
     SYSCHECK(setsockopt(sock->fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)), "setsockopt");
 #if defined(SO_REUSEPORT)
+    // SO_REUSEPORT 允许多个套接字绑定到同一个 IP + 端口 组合(多进程的情况)。多个进程同时监听同一端口，内核自动分配连接请求（替代传统的单进程 accept 模型）。
     SYSCHECK(setsockopt(sock->fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)), "setsockopt");
 #endif
   }
 
-  // addr port should be 0 (Any port)
+  // addr port should be 0 (Any port) 如果地址中的 port 为 0，则系统会自动分配一个未使用的端口。
   SYSCHECK(bind(sock->fd, &sock->addr.sa, sock->salen), "bind");
 
   /* Get the assigned Port */
   socklen_t size = sock->salen;
+  //获取系统实际分配的端口号（因为 bind 时可能用了 0 端口，由系统自动分配）。
   SYSCHECK(getsockname(sock->fd, &sock->addr.sa, &size), "getsockname");
 
 #ifdef ENABLE_TRACE
@@ -414,6 +420,8 @@ ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
   /* Put the socket in listen mode
    * NB: The backlog will be silently truncated to the value in /proc/sys/net/core/somaxconn
    */
+  //将 socket 设置为监听状态，准备接受客户端连接.这里设为 16384，表示最多允许 16384 个连接排队等待 accept。
+  //实际值可能会被系统限制 /proc/sys/net/core/somaxconn 截断
   SYSCHECK(listen(sock->fd, 16384), "listen");
   sock->state = ncclSocketStateReady;
   return ncclSuccess;
@@ -428,7 +436,7 @@ ncclResult_t ncclSocketGetAddr(struct ncclSocket* sock, union ncclSocketAddress*
   memcpy(addr, &sock->addr, sizeof(union ncclSocketAddress));
   return ncclSuccess;
 }
-
+//
 static ncclResult_t socketTryAccept(struct ncclSocket* sock) {
   socklen_t socklen = sizeof(union ncclSocketAddress);
   sock->fd = accept(sock->acceptFd, (struct sockaddr*)&sock->addr, &socklen);
@@ -510,16 +518,15 @@ static ncclResult_t socketFinalizeAccept(struct ncclSocket* sock) {
   }
   return ncclSuccess;
 }
-//重置socket的文件描述符,保持文件描述符号码不变（如果已存在）
-//为什么要这么做？因为这个函数在socket连接失败需要重试时很有用，它可以重置socket到初始状态而不改变文件描述符号码。
+//重置socket的文件描述符
 static ncclResult_t socketResetFd(struct ncclSocket* sock) {
   ncclResult_t ret = ncclSuccess;
   int fd = -1;
   SYSCHECKGOTO(fd = socket(sock->addr.sa.sa_family, SOCK_STREAM, 0), "socket", ret, cleanup);
   // if sock->fd is valid, close it and reuse its number
   if (sock->fd != -1) {
-    SYSCHECKGOTO(dup2(fd, sock->fd), "dup2", ret, cleanup);// 如果已有文件描述符，则复用它
-    SYSCHECKGOTO(close(fd), "close", ret, cleanup);// 关闭新fd
+    SYSCHECKGOTO(dup2(fd, sock->fd), "dup2", ret, cleanup);// 
+    SYSCHECKGOTO(close(fd), "close", ret, cleanup);// 
   } else {
     sock->fd = fd;
   }
@@ -598,26 +605,31 @@ ncclResult_t ncclSocketPollConnect(struct ncclSocket* sock) {
   NCCLCHECK(socketPollConnect(sock));
   return ncclSuccess;
 }
-
+//如果sock->asyncFlag为0，则发送magic和type到对端，表示连接的完成；如果为1，则使用异步方式发送，直到发送完magic和type。
 static ncclResult_t socketFinalizeConnect(struct ncclSocket* sock) {
-  int sent;
+  int sent;//已发送的数据量
+  //（同步模式），则直接通过 socketWait 发送 magic 和 type，确保对端收到正确的标识符。(magic表示正确的连接，type表示正确的socket类型（比如是用于bootstrap、proxy还是等等）)
   if (sock->asyncFlag == 0) {
     sent = 0;
     NCCLCHECK(socketWait(NCCL_SOCKET_SEND, sock, &sock->magic, sizeof(sock->magic), &sent));
     sent = 0;
     NCCLCHECK(socketWait(NCCL_SOCKET_SEND, sock, &sock->type, sizeof(sock->type), &sent));
-  } else {
+  } else {//异步模式，则分阶段发送数据，直到所有数据发送完毕。
+    
     if (sock->finalizeCounter < sizeof(sock->magic)) {
+      // 发送 magic 的部分数据
       sent = sock->finalizeCounter;
       NCCLCHECK(socketProgress(NCCL_SOCKET_SEND, sock, &sock->magic, sizeof(sock->magic), &sent));
       sock->finalizeCounter = sent;
-      if (sent < sizeof(sock->magic)) return ncclSuccess;
+      if (sent < sizeof(sock->magic)) return ncclSuccess;//如果未完成，返回 ncclSuccess 等待下次调用
     }
+    //此时finalizeCounter就是已经发送的数据大小，所以这里就接着发type的数据
     sent = sock->finalizeCounter - sizeof(sock->magic);
     NCCLCHECK(socketProgress(NCCL_SOCKET_SEND, sock, &sock->type, sizeof(sock->type), &sent));
     sock->finalizeCounter = sent + sizeof(sock->magic);
-    if (sent < sizeof(sock->type)) return ncclSuccess;
+    if (sent < sizeof(sock->type)) return ncclSuccess;//如果未完成，返回 ncclSuccess 等待下次调用（因为返回了ncclSuccess，所以不会修改socket的state）
   }
+  //最终结束了，将socket状态设置为ncclSocketStateReady
   sock->state = ncclSocketStateReady;
   return ncclSuccess;
 }
@@ -682,7 +694,7 @@ ncclResult_t ncclSocketConnect(struct ncclSocket* sock) {
   sock->state = ncclSocketStateConnecting;
   sock->finalizeCounter = 0;
   do {
-    NCCLCHECK(socketProgressState(sock));
+    NCCLCHECK(socketProgressState(sock));//直到ready状态为止
   } while (sock->asyncFlag == 0 &&
       (sock->abortFlag == NULL || __atomic_load_n(sock->abortFlag, __ATOMIC_ACQUIRE) == 0) &&
       (sock->state == ncclSocketStateConnecting ||
@@ -705,6 +717,7 @@ ncclResult_t ncclSocketConnect(struct ncclSocket* sock) {
   }
 }
 //nccl封装的accept函数，实现了标准socket accept操作的封装，并添加了状态管理和错误处理
+// accept到的信息放在sock中
 ncclResult_t ncclSocketAccept(struct ncclSocket* sock, struct ncclSocket* listenSock) {
   ncclResult_t ret = ncclSuccess;
 
@@ -724,7 +737,7 @@ ncclResult_t ncclSocketAccept(struct ncclSocket* sock, struct ncclSocket* listen
 
   if (sock->acceptFd == -1) {//还没初始化，先初始化一下。
     memcpy(sock, listenSock, sizeof(struct ncclSocket));
-    sock->acceptFd = listenSock->fd;
+    sock->acceptFd = listenSock->fd;// 这里的acceptFd是指监听套接字的文件描述符
     sock->state = ncclSocketStateAccepting;
     sock->finalizeCounter = 0;
   }

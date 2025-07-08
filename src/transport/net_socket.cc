@@ -343,7 +343,7 @@ fail:
   goto exit;
 }
 //非阻塞式的连接建立过程，允许NCCL在高并发环境中高效地建立多个连接。opaqueHandle : 包含远程节点连接信息的句柄,sendDevComm : 设备卸载相关参数（Socket后端不使用）
-//sendComm 封装了发送端所需的所有资源和状态。
+//sendComm 封装了发送端所需的所有资源和状态。（其实就是connect到远端的各种信息，之后可以用这个comm去发送信息。）
 ncclResult_t ncclNetSocketConnect(int dev, void* opaqueHandle, void** sendComm, ncclNetDeviceHandle_t** /*sendDevComm*/) {
   if (dev < 0 || dev >= ncclNetIfs) { // data transfer socket is based on specified dev
     return ncclInternalError;
@@ -389,6 +389,7 @@ ncclResult_t ncclNetSocketConnect(int dev, void* opaqueHandle, void** sendComm, 
 
 socket_connect_check:
     NCCLCHECK(ncclSocketReady(sock, &ready));
+    //如果没有ready，表示连接还没有完成，这里不会阻塞等待，而是返回ncclSuccess，表示可以继续处理其他任务。（注意上面对i的记录很关键，决定着下次调用从哪个socket开始）
     if (! ready) return ncclSuccess;//这是NCCL中实现非阻塞连接的关键机制。由于TCP连接建立需要时间（三次握手过程），NCCL不会阻塞等待连接完成，而是通过这种方式实现异步连接
     stage->state = ncclNetSocketCommStateSend;//连接成功，准备发送数据。
 
